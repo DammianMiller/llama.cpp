@@ -1147,6 +1147,21 @@ private:
             return false;
         }
 
+        if (
+            slot.spec == nullptr &&
+            task.params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE &&
+            task.params.speculative.n_max > 0 &&
+            mctx == nullptr &&
+            common_speculative_is_compat(ctx)
+        ) {
+            slot.spec = common_speculative_init(task.params.speculative, slot.ctx);
+            if (slot.spec != nullptr) {
+                SLT_INF(slot, "%s", "speculative decoding context re-initialized for new task\n");
+            } else {
+                SLT_WRN(slot, "%s", "failed to re-initialize speculative decoding context\n");
+            }
+        }
+
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
         // initialize samplers
@@ -2895,7 +2910,21 @@ private:
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1)) {
+                    SLT_WRN(slot, "failed to rollback speculative draft tokens at pos=%d - clearing the memory\n", slot.prompt.n_tokens());
+
+                    if (slot.spec != nullptr) {
+                        common_speculative_free(slot.spec);
+                        slot.spec = nullptr;
+                        SLT_WRN(slot, "%s", "speculative decoding disabled for this slot after rollback failure\n");
+                    }
+
+                    slot.prompt_clear(true);
+                    slot.n_prompt_tokens_cache = 0;
+                    slot.i_batch_dft.clear();
+                    slot.drafted.clear();
+                    continue;
+                }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;
