@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <vector>
+#include <unordered_map>
 
 //
 // llama_memory_hybrid
@@ -87,6 +88,23 @@ private:
 
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+
+    // CPU-side checkpoint for speculative decoding rollback
+    // Stores recurrent state (R/S tensors + cell position) in CPU RAM
+    // before speculative batches, enabling rollback without extra GPU cells
+    struct recurrent_checkpoint {
+        llama_pos     pos = -1;
+        int32_t       cell_id = -1;
+        std::vector<std::vector<uint8_t>> r_data;  // per-layer R tensor data
+        std::vector<std::vector<uint8_t>> s_data;  // per-layer S tensor data
+        bool valid = false;
+    };
+    std::unordered_map<llama_seq_id, recurrent_checkpoint> cpu_checkpoints;
+
+    // Save/restore recurrent state to/from CPU RAM
+    void save_recurrent_checkpoint(llama_seq_id seq_id);
+    bool restore_recurrent_checkpoint(llama_seq_id seq_id);
+    bool has_recurrent_checkpoint(llama_seq_id seq_id) const;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {
