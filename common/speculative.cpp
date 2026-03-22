@@ -311,15 +311,28 @@ struct common_speculative_state_draft : public common_speculative_state {
             }
 
             if (reuse_i > 0) {
-                llama_memory_seq_rm (mem_dft, 0, 0, reuse_i);
-                llama_memory_seq_add(mem_dft, 0, reuse_i, -1, -reuse_i);
-
-                prompt_dft.erase(prompt_dft.begin(), prompt_dft.begin() + reuse_i);
+                if (!llama_memory_seq_rm (mem_dft, 0, 0, reuse_i)) {
+                    LOG_DBG("%s: leading seq_rm failed on draft, falling back to full clear\n", __func__);
+                    llama_memory_clear(mem_dft, false);
+                    prompt_dft.clear();
+                    reuse_n = 0;
+                } else {
+                    llama_memory_seq_add(mem_dft, 0, reuse_i, -1, -reuse_i);
+                    prompt_dft.erase(prompt_dft.begin(), prompt_dft.begin() + reuse_i);
+                }
             }
 
             if (reuse_n < (int) prompt_dft.size()) {
-                llama_memory_seq_rm (mem_dft, 0, reuse_n, -1);
-                prompt_dft.erase(prompt_dft.begin() + reuse_n, prompt_dft.end());
+                if (!llama_memory_seq_rm (mem_dft, 0, reuse_n, -1)) {
+                    // For hybrid/recurrent models, partial tail removal may fail if no
+                    // checkpoint exists at the required position. Fall back to full clear.
+                    LOG_DBG("%s: seq_rm failed on draft, falling back to full clear\n", __func__);
+                    llama_memory_clear(mem_dft, false);
+                    prompt_dft.clear();
+                    reuse_n = 0;
+                } else {
+                    prompt_dft.erase(prompt_dft.begin() + reuse_n, prompt_dft.end());
+                }
             }
         }
 
@@ -822,9 +835,50 @@ bool common_speculative_is_compat(llama_context * ctx_tgt) {
 
     // try to remove the last tokens
     if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
-        LOG_WRN("%s: the target context does not support partial sequence removal\n", __func__);
-        res = false;
-        goto done;
+        // For hybrid/recurrent models, the first decode creates the initial cell
+        // but no checkpoint exists yet. Do a second decode to trigger checkpoint
+        // creation, then test rollback via seq_rm.
+        const llama_model * model = llama_get_model(ctx_tgt);
+        if (model && llama_model_is_hybrid(model)) {
+            LOG_INF("%s: hybrid model detected - testing with checkpoint rollback\n", __func__);
+
+            // restore state: the first seq_rm failed but didn't mutate the cache
+            // decode two more tokens so hybrid caches can checkpoint pos 1
+            llama_batch batch2 = llama_batch_init(2, 0, 1);
+            batch2.n_tokens     = 2;
+            batch2.token[0]     = 0;
+            batch2.token[1]     = 0;
+            batch2.pos[0]       = 2;
+            batch2.pos[1]       = 3;
+            batch2.n_seq_id[0]  = 1;
+            batch2.n_seq_id[1]  = 1;
+            batch2.seq_id[0][0] = 0;
+            batch2.seq_id[1][0] = 0;
+            batch2.logits[0]    = false;
+            batch2.logits[1]    = true;
+
+            ret = llama_decode(ctx_tgt, batch2);
+            llama_batch_free(batch2);
+
+            if (ret != 0) {
+                LOG_ERR("%s: follow-up llama_decode() failed: %d\n", __func__, ret);
+                res = false;
+                goto done;
+            }
+
+            // now try removing pos 2 -- checkpoint at pos 1 should exist
+            if (!llama_memory_seq_rm(mem, 0, 2, -1)) {
+                LOG_WRN("%s: hybrid model checkpoint rollback test failed\n", __func__);
+                res = false;
+                goto done;
+            }
+
+            LOG_INF("%s: hybrid model speculative decoding via checkpoint rollback is supported\n", __func__);
+        } else {
+            LOG_WRN("%s: the target context does not support partial sequence removal\n", __func__);
+            res = false;
+            goto done;
+        }
     }
 
 done:
