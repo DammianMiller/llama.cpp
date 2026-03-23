@@ -7,7 +7,6 @@
 #include "llama-memory-recurrent.h"
 
 #include <memory>
-#include <deque>
 #include <vector>
 #include <unordered_map>
 
@@ -20,13 +19,6 @@
 
 class llama_memory_hybrid : public llama_memory_i {
 public:
-    enum class rollback_mode {
-        strict,
-        replay,
-        coverage,
-        hybrid,
-    };
-
     llama_memory_hybrid(
         const llama_model & model,
                             /* attn */
@@ -107,16 +99,12 @@ private:
         std::vector<std::vector<uint8_t>> s_data;  // per-layer S tensor data
         bool valid = false;
     };
-    std::unordered_map<llama_seq_id, std::deque<recurrent_checkpoint>> cpu_checkpoints;
-    rollback_mode mode = rollback_mode::hybrid;
-    uint32_t checkpoint_depth = 8;
-    uint32_t checkpoint_batch_token_limit = 64;
+    std::unordered_map<llama_seq_id, recurrent_checkpoint> cpu_checkpoints;
 
     // Save/restore recurrent state to/from CPU RAM
     void save_recurrent_checkpoint(llama_seq_id seq_id);
-    bool restore_recurrent_checkpoint(llama_seq_id seq_id, llama_pos target_pos, bool allow_nearest, bool * exact_hit = nullptr);
-    bool has_recurrent_checkpoint(llama_seq_id seq_id, llama_pos target_pos, bool allow_nearest) const;
-    void clear_seq_checkpoints(llama_seq_id seq_id);
+    bool restore_recurrent_checkpoint(llama_seq_id seq_id);
+    bool has_recurrent_checkpoint(llama_seq_id seq_id) const;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {
