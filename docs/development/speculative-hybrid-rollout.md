@@ -19,6 +19,18 @@ The implementation in this branch keeps strict compatibility behavior between sp
 
 Operationally, the best tested profile came from balancing draft aggressiveness (not the most aggressive draft settings).
 
+### Files changed in this branch
+
+- `common/speculative.cpp`
+- `src/llama-memory-hybrid.cpp`
+- `src/llama-memory-hybrid.h`
+
+### Behavioral contract
+
+For hybrid/recurrent contexts, speculative compatibility is validated by rollback behavior in `common_speculative_is_compat()`. If rollback semantics drift, speculative should be treated as incompatible for that context.
+
+In other words, correctness comes first: accepted drafts must never leave recurrent and attention memory out of sync.
+
 ## Operational Profiles Tested
 
 ### Baseline Fast Profile (historical)
@@ -35,6 +47,18 @@ Operationally, the best tested profile came from balancing draft aggressiveness 
 
 The balanced profile reduced instability/loop pressure in agentic runs while keeping strong decode throughput.
 
+### Suggested default startup flags (hybrid/recurrent)
+
+```bash
+--spec-type ngram-cache --draft-max 12 --draft-min 2 --draft-p-min 0.80
+```
+
+Use strict rollback mode for stability-first operation:
+
+```bash
+LLAMA_HYBRID_ROLLBACK_MODE=strict
+```
+
 ## Benchmark and Validation Notes
 
 ### Qwen3.5-35B-A3B (long-context service)
@@ -44,6 +68,12 @@ The balanced profile reduced instability/loop pressure in agentic runs while kee
   - no `find_slot: non-consecutive token position` warnings,
   - no rollback failures,
   - no speculative auto-disable events.
+
+Observed service-level metrics in tuned operation typically show:
+
+- high prompt throughput (prefill),
+- moderate decode throughput,
+- stable acceptance without recurrent rollback failure churn.
 
 ### Qwen3.5-27B (Downloads model)
 
@@ -59,11 +89,51 @@ Interpretation:
 - pattern/repetition-heavy generation benefits strongly;
 - coding-style prompts are near throughput-neutral between aggressive and balanced settings, so balanced settings are preferred for reliability.
 
+## Troubleshooting
+
+### Low acceptance rate
+
+Symptom:
+
+- repeated low `draft acceptance rate` values.
+
+Actions:
+
+1. reduce `--draft-max`;
+2. increase `--draft-p-min`;
+3. re-check on representative prompts.
+
+### Recurrent rollback warning / speculative disable
+
+Symptom:
+
+- `failed to rollback speculative draft tokens ...`
+- `speculative decoding disabled for this slot ...`
+
+Actions:
+
+1. use strict rollback profile;
+2. reduce draft aggressiveness;
+3. confirm no stale context/process mix between runs.
+
+### Context initialization OOM
+
+Symptom:
+
+- model loads but context or KV allocation fails at very large context.
+
+Actions:
+
+1. use quantized KV cache (`--cache-type-k q4_0 --cache-type-v q4_0`),
+2. reduce `--ctx-size` for standalone benchmark process,
+3. avoid running parallel GPU consumers during initialization.
+
 ## Recommended Rollout
 
 1. Start with balanced speculative settings (`12/2/0.80`).
 2. Keep metrics enabled and watch acceptance/rollback behavior.
 3. Only move to more aggressive draft settings when acceptance is consistently high and function quality remains stable.
+4. Re-validate with both coding-style and repetition-heavy prompts before promoting config changes.
 
 ## Credits and References
 

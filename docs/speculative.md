@@ -26,6 +26,22 @@ See:
 
 - #5479, #6828, #6848
 
+#### Hybrid/recurrent tuning notes
+
+For hybrid/recurrent models, speculative speedups are highly workload-dependent. A balanced profile often provides better function/performance tradeoff than aggressive draft settings:
+
+```bash
+--spec-type ngram-cache --draft-max 12 --draft-min 2 --draft-p-min 0.80
+```
+
+When prioritizing stability over peak speed, use strict rollback behavior:
+
+```bash
+LLAMA_HYBRID_ROLLBACK_MODE=strict
+```
+
+For detailed rollout, troubleshooting, and validation guidance, see `docs/development/speculative-hybrid-rollout.md`.
+
 ### n-gram Map (`ngram-simple`, `ngram-map-*`)
 
 These implementations search the token history for patterns and use matching sequences as draft candidates.
