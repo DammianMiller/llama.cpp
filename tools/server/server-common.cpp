@@ -1398,8 +1398,12 @@ json convert_responses_to_chatcmpl(const json & response_body) {
         for (json resp_tool : response_body.at("tools")) {
             json chatcmpl_tool;
 
-            if (json_value(resp_tool, "type", std::string()) != "function") {
-                throw std::invalid_argument("'type' of tool must be 'function'");
+            const std::string tool_type = json_value(resp_tool, "type", std::string());
+            if (tool_type != "function") {
+                // Skip non-function tools (e.g. computer_use_preview, web_search_preview, mcp)
+                // These are OpenAI-specific built-in tools that cannot be mapped to chat completions
+                SRV_WRN("skipping unsupported tool type '%s' in /v1/responses request\n", tool_type.c_str());
+                continue;
             }
             resp_tool.erase("type");
             chatcmpl_tool["type"] = "function";

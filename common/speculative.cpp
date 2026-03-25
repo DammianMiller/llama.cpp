@@ -833,17 +833,20 @@ bool common_speculative_is_compat(llama_context * ctx_tgt) {
         goto done;
     }
 
-    // try to remove the last tokens
+    // try to remove the last token — for pure attention models this succeeds directly
     if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
-        // For hybrid/recurrent models, the first decode creates the initial cell
-        // but no checkpoint exists yet. Do a second decode to trigger checkpoint
-        // creation, then test rollback via seq_rm.
+        // For hybrid/recurrent models, partial tail removal fails because SSM
+        // state cannot be rewound. The seq_rm call above still saves a checkpoint
+        // at the current position (pos 1) into the ring buffer, which we can use
+        // to test intermediate-position rollback below.
         const llama_model * model = llama_get_model(ctx_tgt);
         if (model && llama_model_is_hybrid(model)) {
-            LOG_INF("%s: hybrid model detected - testing with checkpoint rollback\n", __func__);
+            LOG_INF("%s: hybrid model detected - testing intermediate-position checkpoint rollback\n", __func__);
 
-            // restore state: the first seq_rm failed but didn't mutate the cache
-            // decode two more tokens so hybrid caches can checkpoint pos 1
+            // The first seq_rm failed but: (a) didn't mutate the cache, and
+            // (b) saved a checkpoint at pos 1.  Decode two more tokens at
+            // pos 2,3 so the state advances to pos 3, then test rollback
+            // to pos 1 (an intermediate position, not the last).
             llama_batch batch2 = llama_batch_init(2, 0, 1);
             batch2.n_tokens     = 2;
             batch2.token[0]     = 0;
@@ -866,9 +869,11 @@ bool common_speculative_is_compat(llama_context * ctx_tgt) {
                 goto done;
             }
 
-            // now try removing pos 2 -- checkpoint at pos 1 should exist
+            // Test intermediate rollback: state is at pos 3, roll back to pos 1.
+            // seq_rm saves checkpoint at pos 3, then restores from the pos-1
+            // checkpoint created by the earlier failed seq_rm.
             if (!llama_memory_seq_rm(mem, 0, 2, -1)) {
-                LOG_WRN("%s: hybrid model checkpoint rollback test failed\n", __func__);
+                LOG_WRN("%s: hybrid model intermediate checkpoint rollback test failed\n", __func__);
                 res = false;
                 goto done;
             }

@@ -89,9 +89,13 @@ private:
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
 
-    // CPU-side checkpoint for speculative decoding rollback
+    // CPU-side ring buffer of checkpoints for speculative decoding rollback.
     // Stores recurrent state (R/S tensors + cell position) in CPU RAM
-    // before speculative batches, enabling rollback without extra GPU cells
+    // before speculative batches, enabling rollback without extra GPU cells.
+    // Ring buffer depth allows rollback to any of the last N positions,
+    // which is critical when multiple draft tokens are generated and partially rejected.
+    static constexpr size_t CHECKPOINT_RING_DEPTH = 6;
+
     struct recurrent_checkpoint {
         llama_pos     pos = -1;
         int32_t       cell_id = -1;
@@ -99,11 +103,19 @@ private:
         std::vector<std::vector<uint8_t>> s_data;  // per-layer S tensor data
         bool valid = false;
     };
-    std::unordered_map<llama_seq_id, recurrent_checkpoint> cpu_checkpoints;
 
-    // Save/restore recurrent state to/from CPU RAM
+    struct checkpoint_ring {
+        recurrent_checkpoint slots[6]; // matches CHECKPOINT_RING_DEPTH
+        size_t write_idx = 0;          // next slot to write into
+        size_t count     = 0;          // number of valid entries (up to CHECKPOINT_RING_DEPTH)
+    };
+
+    std::unordered_map<llama_seq_id, checkpoint_ring> cpu_checkpoints;
+
+    // Save/restore recurrent state to/from CPU RAM ring buffer
     void save_recurrent_checkpoint(llama_seq_id seq_id);
-    bool restore_recurrent_checkpoint(llama_seq_id seq_id);
+    // Returns actual restored position on success, -1 on failure
+    llama_pos restore_recurrent_checkpoint(llama_seq_id seq_id, llama_pos target_pos);
     bool has_recurrent_checkpoint(llama_seq_id seq_id) const;
 };
 
