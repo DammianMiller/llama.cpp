@@ -93,16 +93,17 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             break;
         }
 
-        // Save recurrent checkpoints before any multi-token batch that could
-        // advance the SSM state. This pre-decode checkpoint provides a rollback
-        // point in case speculative tokens are partially rejected by seq_rm().
-        // Skip single-token batches (normal generation) and very large batches
-        // (initial prompt prefill >512 tokens).
+        // Save recurrent checkpoints before each batch that advances SSM state.
+        // This pre-decode checkpoint provides a rollback point for speculative
+        // decoding. We save for ALL batch sizes (including single-token) so that
+        // the ring buffer always has a recent checkpoint for seq_rm to restore from.
+        // Only skip very large batches (initial prompt prefill >512 tokens) to
+        // avoid the overhead of checkpointing during prompt ingestion.
         {
             std::unordered_set<llama_seq_id> seqs_to_checkpoint;
 
             for (const auto & ub : ubatches) {
-                if (ub.n_tokens <= 1 || ub.n_tokens > 512) {
+                if (ub.n_tokens > 512) {
                     continue;
                 }
 
