@@ -8074,6 +8074,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
+                    // For hybrid models, allocate extra recurrent cells for speculative
+                    // decoding checkpoints and seq_cp operations. Need at least:
+                    //   1 cell per seq for current state
+                    //   1 cell per seq for seq_cp (spec decode setup)
+                    //   N cells per seq for checkpoint history (rollback)
+                    // Each cell costs ~63 MiB for Qwen3.5-35B-A3B (S=60 MiB, R=2.8 MiB).
+                    // 6 extra per seq gives 7 total = comfortable margin for spec decode.
+                    const uint32_t recurrent_extra = 0 * std::max((uint32_t) 1, cparams.n_seq_max);
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
@@ -8087,7 +8096,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
                             /* recurrent_type_s  */ GGML_TYPE_F32,
-                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max) + recurrent_extra,
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
@@ -8105,7 +8114,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max) + recurrent_extra,
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
