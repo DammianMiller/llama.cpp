@@ -342,11 +342,6 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return false;
         }
 
-        // Bug (a) fix: save current (post-decode) state into the ring buffer
-        // BEFORE restoring. This captures the correct post-decode position so
-        // future rollbacks can restore to this point.
-        save_recurrent_checkpoint(seq_id);
-
         const llama_pos target_pos = p0 - 1;
 
         // Bug (b)+(c) fix: restore returns actual position for attention trim
