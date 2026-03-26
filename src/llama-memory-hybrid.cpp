@@ -90,6 +90,39 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             break;
         }
 
+        // Save recurrent checkpoints before speculative (multi-token) batches.
+        // This enables rollback in seq_rm() without increasing recurrent tensor size.
+        bool has_speculative_batch = false;
+        std::unordered_set<llama_seq_id> seqs_to_checkpoint;
+
+        for (const auto & ub : ubatches) {
+            if (ub.n_tokens <= ub.n_seqs) {
+                continue;
+            }
+
+            has_speculative_batch = true;
+
+            if (ub.seq_id == nullptr || ub.n_seq_id == nullptr) {
+                continue;
+            }
+
+            uint32_t offset = 0;
+            for (uint32_t s = 0; s < ub.n_seqs; ++s) {
+                if (ub.n_seq_id[s] == 0) {
+                    continue;
+                }
+                const llama_seq_id seq_id = ub.seq_id[offset][0];
+                seqs_to_checkpoint.insert(seq_id);
+                offset += ub.n_seq_id[s];
+            }
+        }
+
+        if (has_speculative_batch) {
+            for (const auto seq_id : seqs_to_checkpoint) {
+                save_recurrent_checkpoint(seq_id);
+            }
+        }
+
         // prepare the recurrent batches first
         if (!mem_recr->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
@@ -127,13 +160,144 @@ bool llama_memory_hybrid::get_can_shift() const {
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
+    cpu_checkpoints.clear();
+}
+
+void llama_memory_hybrid::save_recurrent_checkpoint(llama_seq_id seq_id) {
+    // Find the cell for this sequence
+    int32_t tail_id = -1;
+    for (uint32_t i = 0; i < mem_recr->size; ++i) {
+        if (mem_recr->cells[i].has_seq_id(seq_id) && !mem_recr->cells[i].is_empty()) {
+            tail_id = (int32_t)i;
+            break;
+        }
+    }
+    if (tail_id < 0) {
+        cpu_checkpoints.erase(seq_id);
+        return;
+    }
+
+    auto & ckpt = cpu_checkpoints[seq_id];
+    ckpt.pos = mem_recr->cells[tail_id].pos;
+    ckpt.cell_id = tail_id;
+
+    // Save R/S tensor data to CPU RAM
+    const uint32_t n_r = (uint32_t)mem_recr->r_l.size();
+    const uint32_t n_s = (uint32_t)mem_recr->s_l.size();
+
+    ckpt.r_data.resize(n_r);
+    ckpt.s_data.resize(n_s);
+
+    for (uint32_t il = 0; il < n_r; ++il) {
+        ggml_tensor * t = mem_recr->r_l[il];
+        size_t nbytes = ggml_nbytes(t);
+        ckpt.r_data[il].resize(nbytes);
+        ggml_backend_tensor_get(t, ckpt.r_data[il].data(), 0, nbytes);
+    }
+
+    for (uint32_t il = 0; il < n_s; ++il) {
+        ggml_tensor * t = mem_recr->s_l[il];
+        size_t nbytes = ggml_nbytes(t);
+        ckpt.s_data[il].resize(nbytes);
+        ggml_backend_tensor_get(t, ckpt.s_data[il].data(), 0, nbytes);
+    }
+
+    LLAMA_LOG_DEBUG("saved recurrent checkpoint for seq %d at pos %d (%zu R + %zu S tensors)\n",
+        seq_id, ckpt.pos, n_r, n_s);
+}
+
+bool llama_memory_hybrid::restore_recurrent_checkpoint(llama_seq_id seq_id) {
+    auto it = cpu_checkpoints.find(seq_id);
+    if (it == cpu_checkpoints.end()) {
+        return false;
+    }
+
+    auto & ckpt = it->second;
+
+    // Find the cell for this sequence
+    int32_t tail_id = -1;
+    for (uint32_t i = 0; i < mem_recr->size; ++i) {
+        if (mem_recr->cells[i].has_seq_id(seq_id) && !mem_recr->cells[i].is_empty()) {
+            tail_id = (int32_t)i;
+            break;
+        }
+    }
+    if (tail_id < 0) {
+        return false;
+    }
+
+    // Restore R/S tensor data from CPU RAM
+    const uint32_t n_r = (uint32_t)mem_recr->r_l.size();
+    const uint32_t n_s = (uint32_t)mem_recr->s_l.size();
+
+    if (ckpt.r_data.size() != n_r || ckpt.s_data.size() != n_s) {
+        LLAMA_LOG_ERROR("checkpoint tensor count mismatch\n");
+        return false;
+    }
+
+    for (uint32_t il = 0; il < n_r; ++il) {
+        ggml_tensor * t = mem_recr->r_l[il];
+        size_t nbytes = ggml_nbytes(t);
+        if (ckpt.r_data[il].size() != nbytes) {
+            LLAMA_LOG_ERROR("checkpoint R tensor size mismatch at layer %u\n", il);
+            return false;
+        }
+        ggml_backend_tensor_set(t, ckpt.r_data[il].data(), 0, nbytes);
+    }
+
+    for (uint32_t il = 0; il < n_s; ++il) {
+        ggml_tensor * t = mem_recr->s_l[il];
+        size_t nbytes = ggml_nbytes(t);
+        if (ckpt.s_data[il].size() != nbytes) {
+            LLAMA_LOG_ERROR("checkpoint S tensor size mismatch at layer %u\n", il);
+            return false;
+        }
+        ggml_backend_tensor_set(t, ckpt.s_data[il].data(), 0, nbytes);
+    }
+
+    // Reset cell position to checkpoint position
+    mem_recr->cells[tail_id].pos = ckpt.pos;
+
+    LLAMA_LOG_DEBUG("restored recurrent checkpoint for seq %d to pos %d\n", seq_id, ckpt.pos);
+    return true;
+}
+
+bool llama_memory_hybrid::has_recurrent_checkpoint(llama_seq_id seq_id) const {
+    return cpu_checkpoints.find(seq_id) != cpu_checkpoints.end();
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
-        return false;
+        // Recurrent seq_rm failed (partial tail removal without checkpoint).
+        // For speculative decoding, we MUST still clean up the attention KV cache
+        // to keep positions consistent. The recurrent state will be stale but
+        // will be overwritten on the next decode at the correct position.
+        //
+        // If we don't clean the KV cache, seq_pos_max will return the stale
+        // max position and the next M-RoPE batch check will fail.
+        LLAMA_LOG_WARN("%s: recurrent seq_rm failed for seq=%d, p0=%d, p1=%d - "
+                       "cleaning attention cache anyway\n", __func__, seq_id, p0, p1);
+        mem_attn->seq_rm(seq_id, p0, p1);
+
+        // Restore recurrent state from CPU checkpoint if available.
+        // This provides correct tensor data (state before the speculative batch).
+        if (has_recurrent_checkpoint(seq_id)) {
+            restore_recurrent_checkpoint(seq_id);
+            LLAMA_LOG_WARN("%s: restored recurrent state from CPU checkpoint for seq=%d\n",
+                           __func__, seq_id);
+        } else {
+            // No checkpoint: force the recurrent cell position to p0-1 so seq_pos_max
+            // is consistent with the attention cache. Tensor data is stale but will be
+            // overwritten when the next token is decoded.
+            for (auto & cell : mem_recr->cells) {
+                if (cell.has_seq_id(seq_id) && cell.pos >= p0) {
+                    cell.pos = p0 - 1;
+                }
+            }
+        }
+        return true;
     }
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
