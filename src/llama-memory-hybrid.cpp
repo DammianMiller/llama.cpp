@@ -253,6 +253,10 @@ llama_pos llama_memory_hybrid::restore_recurrent_checkpoint(llama_seq_id seq_id,
     if (!best) {
         LLAMA_LOG_WARN("no suitable checkpoint for seq %d at target pos %d (ring has %zu entries)\n",
             seq_id, (int)target_pos, ring.count);
+        for (size_t k = 0; k < ring.count; ++k) {
+            const auto & slot = ring.slots[k];
+            LLAMA_LOG_WARN("  ring[%zu]: pos=%d valid=%d\n", k, (int)slot.pos, (int)slot.valid);
+        }
         return -1;
     }
 

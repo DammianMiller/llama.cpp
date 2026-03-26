@@ -8038,13 +8038,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // checks
         default:
             {
+                // For recurrent/hybrid models, allocate enough cells for checkpointing
+                // during speculative decoding rollback. Each sequence needs at least
+                // 1 active cell + checkpoint cells for state restoration.
+                const uint32_t rs_cells = std::max((uint32_t) 4, cparams.n_seq_max * 4);
+
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
                             *this,
                             GGML_TYPE_F32,
                             GGML_TYPE_F32,
                             cparams.offload_kqv,
-                            std::max((uint32_t) 1, cparams.n_seq_max),
+                            rs_cells,
                             cparams.n_seq_max,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch)) {
@@ -8077,7 +8082,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
                             /* recurrent_type_s  */ GGML_TYPE_F32,
-                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* recurrent_rs_size */ rs_cells,
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
@@ -8095,7 +8100,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* recurrent_kv_size */ rs_cells,
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,

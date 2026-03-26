@@ -423,28 +423,38 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         return;
     }
 
-    ggml_init_params params = {
-        /*.mem_size   =*/ size_t(2*ggml_tensor_overhead()),
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true,
-    };
+    if ((uint32_t)i_src >= size || (uint32_t)i_dst >= size) {
+        LLAMA_LOG_ERROR("%s: cell index out of bounds: i_src=%d, i_dst=%d, size=%u\n",
+            __func__, i_src, i_dst, size);
+        return;
+    }
 
     for (uint32_t il = 0; il < hparams.n_layer; ++il) {
         if (r_l[il]) {
-            ggml_context * ctx = ggml_init(params);
-            size_t r_row_size = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
-            ggml_tensor * src_v = ggml_view_1d(ctx, r_l[il], r_row_size, i_src * r_row_size);
-            ggml_tensor * dst_v = ggml_view_1d(ctx, r_l[il], r_row_size, i_dst * r_row_size);
-            ggml_backend_tensor_copy(src_v, dst_v);
-            ggml_free(ctx);
+            const size_t r_row_size = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+            const size_t tensor_bytes = ggml_nbytes(r_l[il]);
+            if ((size_t)(i_src + 1) * r_row_size > tensor_bytes ||
+                (size_t)(i_dst + 1) * r_row_size > tensor_bytes) {
+                LLAMA_LOG_ERROR("%s: r_l[%u] offset out of bounds: i_src=%d, i_dst=%d, row_size=%zu, tensor_bytes=%zu\n",
+                    __func__, il, i_src, i_dst, r_row_size, tensor_bytes);
+                continue;
+            }
+            std::vector<uint8_t> tmp(r_row_size);
+            ggml_backend_tensor_get(r_l[il], tmp.data(), (size_t)i_src * r_row_size, r_row_size);
+            ggml_backend_tensor_set(r_l[il], tmp.data(), (size_t)i_dst * r_row_size, r_row_size);
         }
         if (s_l[il]) {
-            ggml_context * ctx = ggml_init(params);
-            size_t s_row_size = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
-            ggml_tensor * src_v = ggml_view_1d(ctx, s_l[il], s_row_size, i_src * s_row_size);
-            ggml_tensor * dst_v = ggml_view_1d(ctx, s_l[il], s_row_size, i_dst * s_row_size);
-            ggml_backend_tensor_copy(src_v, dst_v);
-            ggml_free(ctx);
+            const size_t s_row_size = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const size_t tensor_bytes = ggml_nbytes(s_l[il]);
+            if ((size_t)(i_src + 1) * s_row_size > tensor_bytes ||
+                (size_t)(i_dst + 1) * s_row_size > tensor_bytes) {
+                LLAMA_LOG_ERROR("%s: s_l[%u] offset out of bounds: i_src=%d, i_dst=%d, row_size=%zu, tensor_bytes=%zu\n",
+                    __func__, il, i_src, i_dst, s_row_size, tensor_bytes);
+                continue;
+            }
+            std::vector<uint8_t> tmp(s_row_size);
+            ggml_backend_tensor_get(s_l[il], tmp.data(), (size_t)i_src * s_row_size, s_row_size);
+            ggml_backend_tensor_set(s_l[il], tmp.data(), (size_t)i_dst * s_row_size, s_row_size);
         }
     }
 }
@@ -616,13 +626,15 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // find next empty cell
     uint32_t next_empty_cell = head;
+    bool has_empty_cell = false;
 
     for (uint32_t i = 0; i < size; ++i) {
         if (next_empty_cell >= size) { next_empty_cell -= size; }
         auto & cell = cells[next_empty_cell];
-        if (cell.is_empty()) { break; }
+        if (cell.is_empty()) { has_empty_cell = true; break; }
         next_empty_cell += 1;
     }
+    if (next_empty_cell >= size) { next_empty_cell = next_empty_cell % size; }
 
     // find usable cell range
     for (uint32_t s = 0; s < n_seqs; ++s) {
@@ -633,35 +645,33 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         if (seq_meta.tail >= 0) {
             auto & cell = cells[seq_meta.tail];
             GGML_ASSERT(cell.has_seq_id(seq_id));
-            // does this seq_id "own" the cell?
             if (cell.seq_id.size() == 1) { has_cell = true; }
         }
         if (!has_cell) {
+            if (!has_empty_cell || !cells[next_empty_cell].is_empty()) {
+                LLAMA_LOG_ERROR("%s: no empty cell available for seq_id %d\n", __func__, seq_id);
+                return false;
+            }
             auto & empty_cell = cells[next_empty_cell];
-            GGML_ASSERT(empty_cell.is_empty());
-            // copy old tail into the empty cell
             if (seq_meta.tail >= 0) {
                 auto & orig_cell = cells[seq_meta.tail];
                 empty_cell.pos = orig_cell.pos;
-                empty_cell.src = seq_meta.tail; // the data should be copied from the previous tail
+                empty_cell.src = seq_meta.tail;
 
-                // Copy state data
                 copy_cell(seq_meta.tail, next_empty_cell);
 
-                // Keep history of previous states for rollback (up to 8 cells per sequence)
+                // Keep history for rollback if space permits
                 if (get_cell_count(seq_id) < 8 && used < size * 0.9) {
-                    // Do not erase seq_id from orig_cell to keep it as a checkpoint
+                    // keep orig_cell as checkpoint
                 } else {
-                    // Erase oldest history point for this sequence
                     int32_t oldest_cell = -1;
                     llama_pos min_pos = std::numeric_limits<llama_pos>::max();
-                    for (uint32_t i = 0; i < size; ++i) {
-                        if (cells[i].has_seq_id(seq_id) && cells[i].pos < min_pos) {
-                            min_pos = cells[i].pos;
-                            oldest_cell = i;
+                    for (uint32_t ci = 0; ci < size; ++ci) {
+                        if (cells[ci].has_seq_id(seq_id) && cells[ci].pos < min_pos) {
+                            min_pos = cells[ci].pos;
+                            oldest_cell = ci;
                         }
                     }
-
                     if (oldest_cell >= 0) {
                         cells[oldest_cell].seq_id.erase(seq_id);
                         if (cells[oldest_cell].is_empty()) {
@@ -671,27 +681,25 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                         }
                     }
                 }
-                empty_cell.seq_id.insert(seq_id); // will be overwritten
+                empty_cell.seq_id.insert(seq_id);
             }
             seq_meta.tail = next_empty_cell;
             // find next empty cell
+            has_empty_cell = false;
             if (s + 1 < n_seqs) {
                 for (uint32_t j = 0; j < size; ++j) {
                     next_empty_cell += 1;
                     if (next_empty_cell >= size) { next_empty_cell -= size; }
                     auto & cell = cells[next_empty_cell];
-                    if (cell.is_empty()) { break; }
+                    if (cell.is_empty()) { has_empty_cell = true; break; }
                 }
             }
         } else {
-            // Sequence owns its cell. Save a checkpoint of the current state before it is
-            // overwritten by new tokens. This is required for speculative decoding rollback
-            // in recurrent/SSM models where tensor state cannot be partially rewound.
+            // Sequence owns its cell - try to checkpoint if possible
             const int32_t cur_tail = seq_meta.tail;
-            if (cells[next_empty_cell].is_empty()) {
+            if (has_empty_cell && cells[next_empty_cell].is_empty()) {
                 bool can_checkpoint = (get_cell_count(seq_id) < 8 && used < size * 0.9);
                 if (!can_checkpoint) {
-                    // Try to evict the oldest checkpoint to make room
                     int32_t oldest = -1;
                     llama_pos min_pos = std::numeric_limits<llama_pos>::max();
                     for (uint32_t j = 0; j < size; ++j) {
@@ -714,20 +722,19 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                     auto & cp_cell = cells[next_empty_cell];
                     copy_cell(cur_tail, next_empty_cell);
                     cp_cell.pos = cells[cur_tail].pos;
-                    cp_cell.src = next_empty_cell; // independent copy, no further movement needed
+                    cp_cell.src = next_empty_cell;
                     cp_cell.seq_id.insert(seq_id);
                     used++;
-                    // advance next_empty_cell for subsequent sequences in this batch
+                    has_empty_cell = false;
                     if (s + 1 < n_seqs) {
                         for (uint32_t j = 0; j < size; ++j) {
                             next_empty_cell += 1;
                             if (next_empty_cell >= size) { next_empty_cell -= size; }
-                            if (cells[next_empty_cell].is_empty()) { break; }
+                            if (cells[next_empty_cell].is_empty()) { has_empty_cell = true; break; }
                         }
                     }
                 }
             }
-            // seq_meta.tail remains unchanged - sequence still owns its current cell
         }
         if (min > seq_meta.tail) { min = seq_meta.tail; }
         if (max < seq_meta.tail) { max = seq_meta.tail; }

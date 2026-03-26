@@ -2895,14 +2895,47 @@ private:
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                const bool rm_ok = llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
 
-                // Activation replay for hybrid models: seq_rm restores the recurrent
-                // checkpoint AND trims the attention KV cache to the checkpoint position.
-                // The M accepted tokens (already verified) need to be re-decoded through
-                // both attention and recurrent layers to bring the caches back in sync.
-                // This is safe because seq_rm cleared all entries beyond the checkpoint.
-                {
+                // For hybrid models, if seq_rm failed (no suitable checkpoint for
+                // recurrent rollback), the caches still have stale rejected entries.
+                // Clear the entire sequence and re-prompt to recover a consistent state.
+                if (!rm_ok) {
+                    const llama_model * mdl = llama_get_model(ctx);
+                    if (mdl && llama_model_is_hybrid(mdl)) {
+                        SLT_WRN(slot, "%s", "speculative rollback failed, clearing cache and re-prompting\n");
+
+                        // Clear entire sequence from memory
+                        llama_memory_seq_rm(llama_get_memory(ctx), slot.id, -1, -1);
+
+                        // Re-decode the full prompt (accepted tokens are already in slot.prompt)
+                        const int n_prompt = slot.prompt.n_tokens();
+                        llama_batch replay_batch = llama_batch_init(n_prompt, 0, 1);
+                        replay_batch.n_tokens = n_prompt;
+                        for (int ri = 0; ri < n_prompt; ri++) {
+                            replay_batch.token[ri]     = slot.prompt.tokens[ri];
+                            replay_batch.pos[ri]       = ri;
+                            replay_batch.n_seq_id[ri]  = 1;
+                            replay_batch.seq_id[ri][0] = slot.id;
+                            replay_batch.logits[ri]    = (ri == n_prompt - 1) ? 1 : 0;
+                        }
+
+                        const int ret = llama_decode(ctx, replay_batch);
+                        llama_batch_free(replay_batch);
+
+                        if (ret != 0) {
+                            SLT_WRN(slot, "re-prompt after rollback failure failed (ret=%d)\n", ret);
+                        } else {
+                            SLT_DBG(slot, "re-prompt successful, %d tokens re-processed\n", n_prompt);
+                        }
+                    }
+                }
+
+                // Activation replay for hybrid models: when seq_rm succeeds via
+                // checkpoint restore, the recurrent state may be behind the attention
+                // KV cache. Re-decode tokens from the checkpoint position forward
+                // to bring the recurrent state in sync with the attention cache.
+                if (rm_ok) {
                     const llama_model * mdl = llama_get_model(ctx);
                     if (mdl && llama_model_is_hybrid(mdl) && ids.size() > 1) {
                         const llama_pos cache_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id);
@@ -2910,15 +2943,14 @@ private:
 
                         if (cache_pos >= 0 && cache_pos < expected_pos) {
                             const int n_replay = (int)(expected_pos - cache_pos);
-                            SLT_DBG(slot, "hybrid activation replay: %d tokens (cache=%d, target=%d)\n",
+                            SLT_DBG(slot, "hybrid activation replay: %d tokens from prompt (cache=%d, target=%d)\n",
                                 n_replay, (int)cache_pos, (int)expected_pos);
 
                             llama_batch replay_batch = llama_batch_init(n_replay, 0, 1);
                             replay_batch.n_tokens = n_replay;
-                            const int n_accepted = (int)ids.size() - 1;
                             for (int ri = 0; ri < n_replay; ri++) {
-                                const int tok_idx = n_accepted - n_replay + ri;
-                                replay_batch.token[ri]     = ids[tok_idx];
+                                const int prompt_idx = (int)(cache_pos + 1) + ri;
+                                replay_batch.token[ri]     = slot.prompt.tokens[prompt_idx];
                                 replay_batch.pos[ri]       = cache_pos + 1 + ri;
                                 replay_batch.n_seq_id[ri]  = 1;
                                 replay_batch.seq_id[ri][0] = slot.id;
