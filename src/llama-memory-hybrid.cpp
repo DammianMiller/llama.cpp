@@ -93,40 +93,6 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             break;
         }
 
-        // Save recurrent checkpoints before short multi-token speculative batches.
-        // Avoid checkpointing long prompt-prefill batches because CPU<->GPU copies
-        // of recurrent state are expensive and unnecessary there.
-        bool has_speculative_batch = false;
-        std::unordered_set<llama_seq_id> seqs_to_checkpoint;
-        constexpr uint32_t max_spec_checkpoint_tokens = 64;
-
-        for (const auto & ub : ubatches) {
-            if (ub.n_tokens <= 1 || ub.n_tokens > max_spec_checkpoint_tokens) {
-                continue;
-            }
-
-            has_speculative_batch = true;
-
-            if (ub.seq_id == nullptr || ub.n_seq_id == nullptr) {
-                continue;
-            }
-
-            for (uint32_t s = 0; s < ub.n_seqs; ++s) {
-                const uint32_t i = s*ub.n_seq_tokens;
-                if (ub.n_seq_id[i] == 0) {
-                    continue;
-                }
-                const llama_seq_id seq_id = ub.seq_id[i][0];
-                seqs_to_checkpoint.insert(seq_id);
-            }
-        }
-
-        if (has_speculative_batch) {
-            for (const auto seq_id : seqs_to_checkpoint) {
-                save_recurrent_checkpoint(seq_id);
-            }
-        }
-
         // prepare the recurrent batches first
         if (!mem_recr->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
@@ -297,11 +263,6 @@ bool llama_memory_hybrid::restore_recurrent_checkpoint(llama_seq_id seq_id) {
     return true;
 }
 
-bool llama_memory_hybrid::has_recurrent_checkpoint(llama_seq_id seq_id) const {
-    const auto it = cpu_checkpoints.find(seq_id);
-    return it != cpu_checkpoints.end() && it->second.valid;
-}
-
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
@@ -315,6 +276,11 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         }
 
         auto it = cpu_checkpoints.find(seq_id);
+        if (it == cpu_checkpoints.end() || !it->second.valid || it->second.pos != p0 - 1) {
+            save_recurrent_checkpoint(seq_id);
+            it = cpu_checkpoints.find(seq_id);
+        }
+
         if (it != cpu_checkpoints.end() && it->second.valid && it->second.pos == p0 - 1) {
             if (!restore_recurrent_checkpoint(seq_id)) {
                 return false;

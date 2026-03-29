@@ -104,7 +104,6 @@ private:
     // Save/restore recurrent state to/from CPU RAM
     void save_recurrent_checkpoint(llama_seq_id seq_id);
     bool restore_recurrent_checkpoint(llama_seq_id seq_id);
-    bool has_recurrent_checkpoint(llama_seq_id seq_id) const;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {
