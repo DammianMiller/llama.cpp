@@ -6,6 +6,17 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+// InnerQ: update the fattn-side inverse scale array from host
+void turbo_innerq_update_fattn_scales(const float * scale_inv) {
+    cudaMemcpyToSymbol(d_innerq_channel_scale_inv_fattn, scale_inv, 128 * sizeof(float));
+}
+
+void turbo_innerq_init_fattn() {
+    float ones[128];
+    for (int i = 0; i < 128; i++) ones[i] = 1.0f;
+    cudaMemcpyToSymbol(d_innerq_channel_scale_inv_fattn, ones, sizeof(ones));
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -262,20 +273,57 @@ static __global__ void k_turbo4_dequant_f16(
     const block_turbo4_0 * blk = (const block_turbo4_0 *)src_row + blk_idx;
 
     const float norm = __half2float(blk->norm);
-    const float rnorm = __half2float(blk->rnorm);
-    const float qjl_scale = 1.2533141f / 128.0f * rnorm;
-
-    const int bit_offset = j_in_blk * 3;
-    const int byte_idx = bit_offset / 8;
-    const int bit_pos = bit_offset % 8;
-    uint16_t raw = (uint16_t)blk->qs[byte_idx];
-    if (byte_idx + 1 < 48) raw |= (uint16_t)blk->qs[byte_idx + 1] << 8;
-    const uint8_t idx = (uint8_t)((raw >> bit_pos) & 0x7);
-
-    const float s = (blk->signs[j_in_blk / 8] & (1 << (j_in_blk % 8))) ? 1.0f : -1.0f;
-    const float val = (d_turbo_centroids_3bit_fattn[idx] + s * qjl_scale) * norm;
+    const uint8_t idx = (j_in_blk & 1) ? (blk->qs[j_in_blk / 2] >> 4) : (blk->qs[j_in_blk / 2] & 0xF);
+    const float val = d_turbo_centroids_4bit_fattn[idx] * norm;
 
     dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
+}
+
+// turbo4 K dequant with inverse FWHT: produces K in original (unrotated) domain
+// so Q does NOT need pre-rotation. 128 threads per block, loops over 128-element turbo4 blocks.
+static __global__ void k_turbo4_dequant_f16_inv_fwht(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int64_t dst_base = strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0;
+
+    __shared__ float smem[128];
+
+    const float * s1 = d_turbo_wht_signs1_fattn;
+    const float * s2 = d_turbo_wht_signs2_fattn;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+
+    const int n_blocks = (int)(ne0 / QK_TURBO4);
+
+    for (int blk_idx = 0; blk_idx < n_blocks; blk_idx++) {
+        const block_turbo4_0 * blk = (const block_turbo4_0 *)src_row + blk_idx;
+        const float norm = __half2float(blk->norm);
+
+        // Extract 4-bit index, lookup centroid, apply signs2
+        const uint8_t idx = (tid & 1) ? (blk->qs[tid / 2] >> 4) : (blk->qs[tid / 2] & 0xF);
+        smem[tid] = d_turbo_centroids_4bit_fattn[idx] * s2[tid];
+        __syncthreads();
+
+        // 7 butterfly passes (inverse FWHT)
+        for (int h = 1; h < 128; h *= 2) {
+            if (tid < 64) {
+                int j = (tid / h) * (2 * h) + (tid % h);
+                float a = smem[j], b = smem[j + h];
+                smem[j] = a + b; smem[j + h] = a - b;
+            }
+            __syncthreads();
+        }
+
+        // Normalize, apply signs1, undo InnerQ scaling, apply norm, cast to fp16
+        float val = smem[tid] * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
+        dst[dst_base + blk_idx * 128 + tid] = __float2half(val);
+    }
 }
 
 // Persistent Q rotation buffer per device (shared between prefill and decode paths)
@@ -297,7 +345,9 @@ static __global__ void k_turbo_fwht_forward(
     __shared__ float buf[128];
 
     if (threadIdx.x < 128) {
-        buf[threadIdx.x] = src[offset + threadIdx.x] * s1[threadIdx.x];
+        // InnerQ: apply inverse channel scale to Q before rotation
+        // This compensates for the channel scaling applied to K in SET_ROWS
+        buf[threadIdx.x] = src[offset + threadIdx.x] * d_innerq_channel_scale_inv_fattn[threadIdx.x] * s1[threadIdx.x];
     }
     __syncthreads();
 
@@ -340,7 +390,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else {
-            k_turbo4_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+            // turbo4 K: inverse FWHT dequant — produces K in original domain (no Q rotation needed)
+            k_turbo4_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         }
     }
@@ -385,10 +436,11 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     }
 
     // Rotate Q for turbo pre-rotate-queries (only when K is in rotated space)
+    // turbo4 K is dequanted via inverse FWHT → original domain, so Q stays unrotated
     // Uses persistent per-device buffer to avoid cudaMallocAsync issues with graph-level ops
     const ggml_tensor * Q = dst->src[0];
     float * q_rotated = nullptr;
-    if (turbo_k && Q->ne[0] % 128 == 0) {
+    if (turbo_k && K->type != GGML_TYPE_TURBO4_0 && Q->ne[0] % 128 == 0) {
         int device;
         CUDA_CHECK(cudaGetDevice(&device));
         const size_t q_size = ggml_nelements(Q) * sizeof(float);
@@ -748,13 +800,20 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    // Turbo prefill optimization: dequant to fp16 and use MMA for large Q batch
-    // turbo4's QJL correction loses ~1% PPL precision in fp16 round-trip, but 2x prefill speedup
-    // is worth it since only prompt tokens are affected (generated tokens use full-precision SET_ROWS)
+    // Turbo prefill: dequant to fp16 and use tensor core MMA for batched attention.
+    // turbo4 K uses inverse FWHT during dequant — mixes centroids in float32 shmem before
+    // fp16 cast, so precision is fine. turbo2/turbo3 use simple centroid×norm dequant.
+    // Set TURBO_PREFILL_VEC=1 to force vec kernel for all turbo types (debug override).
+    static const bool turbo_prefill_vec = [] {
+        const char * e = getenv("TURBO_PREFILL_VEC");
+        if (e) fprintf(stderr, "TURBO_PREFILL_VEC=%s: forcing vec prefill for turbo types\n", e);
+        return e != nullptr;
+    }();
     const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
                           V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
-    if (turbo_kv && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
-        // Prefill path: Q rotation handled inside, V un-rotation at graph level
+    if (turbo_kv && !turbo_prefill_vec && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        // Prefill path: turbo4 K uses inverse FWHT dequant (original domain, no Q rotation),
+        // turbo2/3 K uses simple dequant (rotated domain, Q pre-rotated). V un-rotation at graph level.
         ggml_cuda_turbo_prefill_attend(ctx, dst);
     } else {
         cudaStream_t stream = ctx.stream();

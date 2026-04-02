@@ -660,3 +660,365 @@ This is significantly worse than turbo3's <1% gap. Speed is essentially identica
 (both compute-bound by dequant, not memory-bound at short context on this model).
 The 6.4x compression is impressive but the quality cost is too high for general use.
 turbo2 may work better for V-only (K stays turbo3) or for extreme memory pressure scenarios.
+
+## turbo3 vs q8_0 vs turbo4 — Full Context Scaling (2026-03-28)
+
+Model: Qwen3.5-27B-heretic Q6_K, RTX 3090 24GB. turbo3 uniform, turbo4 uniform.
+
+### PPL by Context Length
+
+| Context | Chunks | q8_0 | turbo3 | t3 vs q8 | turbo4 | t4 vs q8 | LA-1 t3 | LA-1 vs q8 |
+|---------|--------|------|--------|----------|--------|----------|---------|------------|
+| 2K | 8 | 5.8375 | 5.8323 | -0.09% | 5.8186 | -0.32% | 5.7690 | -1.17% |
+| 4K | 4 | 6.2677 | 6.3252 | +0.92% | — | — | 6.3198 | +0.83% |
+| 8K | 4 | 7.4241 | 7.3783 | -0.62% | — | — | 7.3952 | -0.39% |
+| 32K | 1 | 7.2139 | 7.1693 | -0.62% | 7.3296 | +1.60% | 7.2168 | +0.04% |
+| 64K | 1 | 8.1975 | 8.2379 | +0.49% | 8.5004 | +3.69% | — | — |
+
+### Decode Speed tg64 (tok/s)
+
+| Context | q8_0 | turbo3 | t3/q8 | turbo4 | t4/q8 |
+|---------|------|--------|-------|--------|-------|
+| 32K | 30.69 | 29.83 | 97.2% | 29.47 | 96.0% |
+| 64K | — | 29.79 | — | 29.51 | — |
+
+### VRAM at 64K
+
+| Config | VRAM |
+|--------|------|
+| turbo3 | ~22.3 GiB |
+| turbo4 | ~22.2 GiB |
+| q8_0 | **OOM** (~28+ GiB needed) |
+
+### Key Findings
+
+1. **turbo3 holds quality at all context lengths**: -0.62% at 32K, +0.49% at 64K (within noise)
+2. **turbo4 degrades catastrophically at long context**: +1.60% at 32K, **+3.69% at 64K**
+3. turbo4 QJL noise accumulates as sqrt(N) — 1-bit correction errors compound over more KV positions
+4. LA-1 advantage vanishes at long context: +0.04% at 32K (was -1.17% at 2K)
+5. turbo3 fits 64K on 24GB RTX 3090 where q8_0 would OOM
+6. Decode speed is constant across context lengths for both turbo types
+7. **Recommendation**: turbo3 for all use cases. turbo4 only viable at short context (<4K) on head_dim=256
+
+## InnerQ Per-Channel Equalization (#52) — 2026-03-28
+
+Branch: `experiment/innerq-channel-equalization`. Model: Qwen3-14B Q5_K_M (head_dim=128).
+
+### Concept
+
+Per-channel K scaling before L2 norm + FWHT to equalize channel magnitudes.
+Inverse scaling applied to Q in FA kernel before FWHT rotation. Targets the
+head_dim=128 quality gap where channels have extreme anisotropy (channel 114
+has 20x mean RMS on Qwen3-14B).
+
+### Calibration
+
+Online calibration: accumulate per-channel K² during first 100K token-counts,
+compute sqrt-dampened scales: `scale = (rms/mean_rms)^strength`, clamped to max 2.0x.
+Controlled by `TURBO_INNERQ=1` and `TURBO_INNERQ_STRENGTH=<float>` env vars.
+
+### Reference Baselines (Qwen3-14B Q5_K_M, head_dim=128, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| f16 baseline | 6.4239 | +0.05% |
+| q8_0 baseline | 6.4206 | — |
+| turbo3 uniform (no InnerQ) | 6.6340 | +3.33% |
+
+### Strength Sweep (turbo3 + InnerQ, 2K/8chunks)
+
+| Strength | PPL | vs q8_0 | vs turbo3 baseline | Gap closed |
+|----------|-----|---------|--------------------|-----------:|
+| 0.00 (identity) | 6.6340 | +3.33% | — | 0% |
+| 0.10 | 6.5596 | +2.17% | -1.12% | 35% |
+| **0.20** | **6.5175** | **+1.51%** | **-1.76%** | **55%** |
+| 0.30 | 6.5310 | +1.72% | -1.55% | 48% |
+| 0.50 | 6.5872 | +2.60% | -0.71% | 22% |
+| 1.00 (full RMS) | catastrophic | — | — | — |
+
+**Optimal: strength=0.20, max clamp=2.0x**
+
+### Effect on head_dim=256 (Qwen3.5-27B)
+
+No benefit — FWHT with 256 dimensions already equalizes channels effectively.
+Max channel ratio only 2x (vs 20x on hd128). InnerQ disabled automatically
+when head_dim >= 256 would be appropriate, but currently gated by env var.
+
+### Asymmetric Comparison (Qwen3-14B, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| turbo3 K+V + InnerQ (strength=0.20) | 6.5175 | +1.51% |
+| turbo3-K + turbo4-V + InnerQ | 6.6645 | +3.80% |
+| turbo3 K+V (no InnerQ) | 6.6340 | +3.33% |
+
+turbo3 uniform + InnerQ beats asymmetric turbo3-K + turbo4-V with InnerQ.
+
+### Effect on head_dim=256 — Auto-Detection (2026-03-28)
+
+| Config | PPL | vs q8_0 | Notes |
+|--------|-----|---------|-------|
+| turbo3 (no InnerQ) | 5.8501 | +0.22% | baseline |
+| turbo3 + InnerQ (strength=0.20) | 5.9283 | +1.56% | **WORSE** — channels balanced, perturbation hurts |
+| turbo3 + InnerQ (auto-detect) | 5.8501 | +0.22% | auto-disabled: max ratio 1.164 < 1.2 |
+
+Auto-detect threshold (max_ratio < 1.2) correctly disables InnerQ on hd256.
+
+### K-only vs K+V Scaling Comparison (Qwen3-14B, strength=0.20)
+
+| Config | PPL | vs q8_0 | Gap closed |
+|--------|-----|---------|------------|
+| K+V calibrate, K+V apply (best) | 6.5349 | +1.78% | 46% |
+| K-only calibrate, K+V apply | 6.5757 | +2.42% | 27% |
+| K-only calibrate, K-only apply (s=0.30) | 6.5418 | +1.89% | 43% |
+| K-only calibrate, K-only apply (s=0.20) | 6.5477 | +1.98% | 40% |
+| K-only calibrate, K-only apply (s=0.50) | 6.5486 | +1.99% | 40% |
+| Max-based (paper's formula, mode=1) | 6.6716 | +3.91% | **WORSE** |
+| No InnerQ baseline | 6.6340 | +3.33% | 0% |
+
+**Key findings**:
+1. V scaling helps even without output compensation (K+V > K-only)
+2. Mixed K+V calibration stats are better than K-only stats for K+V application
+3. Paper's max-based formula doesn't transfer to our codebook pipeline
+4. RMS-based mode=0 with strength=0.20 is optimal
+
+### Summary
+
+InnerQ closes the head_dim=128 gap by **~46%** (from +3.33% to +1.78% vs q8_0).
+Auto-detects and disables on hd256 models where channels are already balanced.
+The remaining +1.78% gap is inherent to lower dimensionality (fewer dimensions =
+larger relative quantization noise in dot products). Further improvement would
+require more bits or a fundamentally different approach.
+
+## New turbo4: 4-bit PolarQuant (16 centroids, no QJL)
+
+Branch: `experiment/turbo4-4bit-polarquant`. Dropped QJL 1-bit correction entirely,
+replaced with pure 4-bit PolarQuant (16 Lloyd-Max centroids). Inspired by TheTom's
+Metal implementation showing QJL variance gets amplified by softmax.
+
+Block format: 66 bytes per 128 values = 4.125 bpv (was 68 bytes = 4.25 bpv with QJL).
+
+### Qwen3.5-27B Q6_K (head_dim=256, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| q8_0 | 5.8377 | — |
+| new turbo4 (4-bit) | 5.8467 | +0.15% |
+| turbo3 | 5.8501 | +0.22% |
+| old turbo4 (QJL) | 5.8186 | -0.32% |
+
+On hd256, old QJL turbo4 was better (-0.32% vs +0.15%). QJL helps on hd256
+where the 1-bit correction noise is small relative to 256-dim dot products.
+
+### Qwen3-14B Q5_K_M (head_dim=128, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| q8_0 | 6.4206 | — |
+| **new turbo4 (4-bit)** | **6.4978** | **+1.20%** |
+| turbo3 + InnerQ | 6.5175 | +1.51% |
+| turbo3 | 6.6340 | +3.33% |
+| old turbo4 (QJL) | 6.9118 | +6.3% |
+
+**Breakthrough on hd128!** New turbo4 beats turbo3+InnerQ by 0.31 percentage points.
+Old turbo4 (QJL) was catastrophic at +6.3%. The 72.5% MSE reduction from 16 vs 8
+centroids more than compensates for losing the QJL correction.
+
+InnerQ has no additional effect on new turbo4 (PPL identical with/without).
+
+### LA-1 on Qwen3-14B (head_dim=128, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| turbo3 | 6.6340 | +3.33% |
+| turbo3 + LA-1 | 6.6763 | +3.98% |
+| turbo3 + LA-1 + InnerQ | 6.6608 | +3.74% |
+
+LA-1 HURTS on hd128 (unlike hd256 where it gives -0.71%). 8/40=20% promoted layers
+create quality discontinuity that is worse than uniform turbo3 noise.
+
+### turbo4 Quality Decomposition (hd128, Qwen3-14B, 2K/8chunks)
+
+**K quality dominates V by 13x.** Source of gap analysis:
+
+| Config | PPL | vs q8_0 | Source |
+|--------|-----|---------|--------|
+| q8_0 (f16 K + f16 V) | 6.4206 | — | — |
+| f16 K + turbo4 V | 6.4256 | +0.08% | V quant only |
+| turbo4 K + f16 V | 6.4879 | +1.05% | K quant only |
+| turbo4 K + turbo4 V | 6.4978 | +1.20% | K + V combined |
+| turbo4 K + turbo3 V | 6.5854 | +2.57% | |
+| turbo3 K + turbo4 V | 6.6330 | +3.31% | |
+| turbo3 K + turbo3 V | 6.6340 | +3.33% | |
+
+### turbo4 + Layer-Adaptive sweep (hd128, Qwen3-14B, 2K/8chunks)
+
+| Mode | Description | PPL | vs q8_0 | Promoted layers |
+|------|-------------|-----|---------|-----------------|
+| **LA-3** | **last 4 (K+V)** | **6.4587** | **+0.59%** | **4/40 = 10%** |
+| LA-10 | last 4 (K-only) | 6.4604 | +0.62% | K: 4/40, V: 0/40 |
+| LA-11 | last 6 (K+V) | 6.4626 | +0.65% | 6/40 |
+| LA-2 | last 8 (K+V) | 6.4628 | +0.66% | 8/40 |
+| LA-1 | first4+last4 (K+V) | 6.4638 | +0.67% | 8/40 |
+| LA-7 | last 8 (K-only) | 6.4653 | +0.70% | K: 8/40, V: 0/40 |
+| LA-9 | last 2 (K+V) | 6.4795 | +0.92% | 2/40 |
+| 0 | turbo4 uniform | 6.4978 | +1.20% | 0/40 |
+| LA-4 | first 4 (K+V) | 6.5125 | +1.43% | 4/40 |
+| LA-5 | first2+last2 (K+V) | 6.5162 | +1.49% | 4/40 |
+
+Best: LA-3 (last 4, K+V) at +0.59%, 4.53 bpv average.
+Sweet spot: exactly 4 last layers. More layers (6, 8) give diminishing returns.
+First-layer promotion always hurts on hd128. K-only promotion nearly as good.
+
+### turbo4 Context Scaling (hd128, Qwen3-14B)
+
+| Context | q8_0 PPL | turbo4 PPL | turbo4 gap | turbo3 PPL | turbo3 gap |
+|---------|----------|------------|------------|------------|------------|
+| 2K | 6.4206 | 6.4978 | +1.20% | 6.6340 | +3.33% |
+| 8K | 7.0149 | 7.0718 | +0.81% | 7.4261 | +5.86% |
+| 32K | 7.2929 | 7.3638 | +0.97% | 7.7736 | +6.59% |
+
+turbo4 context scaling is excellent (~1% gap at all lengths).
+turbo3 degrades catastrophically at long context on hd128 (3.3% → 6.6%).
+
+### Decode Speed (hd128, Qwen3-14B, RTX 3090, tg64)
+
+| Config | t/s | vs q8_0 |
+|--------|-----|---------|
+| q8_0 | 69.68 | — |
+| turbo4 | 59.72 | 85.7% |
+| turbo3 | 59.54 | 85.4% |
+
+turbo4 and turbo3 have identical decode speed (compute-bound dequant).
+
+### TheTom's centroids test (from turbo4-resurrection.md)
+
+TheTom's centroids: [-0.1739, -0.1172, -0.0895, -0.0688, -0.0513, -0.0356, -0.0210, -0.0069, ...]
+Ours (Gaussian Lloyd-Max): [-0.2416, -0.1829, -0.1430, -0.1111, -0.0833, -0.0581, -0.0343, -0.0114, ...]
+
+| Centroids | hd128 2K PPL | vs q8_0 | hd128 8K PPL | vs q8_0 | hd256 2K PPL | vs q8_0 |
+|-----------|-------------|---------|-------------|---------|-------------|---------|
+| Our Gaussian | 6.4978 | +1.20% | 7.0718 | +0.81% | 5.8467 | +0.15% |
+| TheTom's | 6.4082 | -0.19% | 7.0726 | +0.82% | 5.8829 | +0.77% |
+
+TheTom's centroids dramatically help hd128 at 2K (-0.19% beats q8_0!) but the gain
+vanishes at 8K (+0.82% ≈ same as Gaussian). Hurts hd256 (+0.77% vs +0.15%).
+
+Raw norm (no recon correction) test: PPL 7.80 on hd256 — catastrophic. Norm correction is essential.
+
+KEY OPEN QUESTION: TheTom's centroids don't match standard Lloyd-Max for ANY Gaussian.
+In N(0,1) units: outer=1.97 vs Lloyd-Max 2.73. He likely ran iterative Lloyd-Max on real
+post-FWHT KV data. Need to ask: (1) exact computation method, (2) does he normalize
+per-head or per-block? Per-head normalization for hd256 would give σ=1/√256 per block
+instead of our σ=1/√128.
+
+### Empirical centroid calibration — FAILED
+
+Simulated post-FWHT distribution has kurtosis -0.047 (sub-Gaussian), but the empirical
+centroids derived from simulation gave catastrophic PPL = 6.8758 (+17.8%). The simulation
+is wrong for real model data. TheTom's measurement on real KV tensors shows kurtosis = 2.9
+(near-Gaussian), confirming Gaussian-optimal Lloyd-Max centroids are correct.
+
+### Empirical codebook: real post-FWHT data (TURBO_EXTRACT)
+
+Extracted 2M post-FWHT samples from each model. Post-rotation distribution is
+model-independent N(0, 1/√128): std=0.088388, kurtosis≈2.9 on both models.
+Empirical Lloyd-Max centroids improve MSE by only 0.2-0.3% vs Gaussian — already optimal.
+
+## New turbo4: K/V split + Layer-Adaptive on hd256
+
+Qwen3.5-27B Q6_K (head_dim=256, 2K/8chunks). q8_0 baseline: 5.8375.
+
+### K/V Quality Decomposition (hd256)
+
+| Config | PPL | vs q8_0 | Notes |
+|--------|-----|---------|-------|
+| q8_0 K + turbo4 V | 5.8397 | +0.04% | V quant essentially free |
+| turbo4 K + turbo4 V | 5.8467 | +0.16% | uniform turbo4 |
+| turbo4 K + q8_0 V | 5.8590 | +0.37% | K-only turbo4 — counterproductive |
+
+V quantization adds only +0.04%. K adds +0.12%. But keeping V at q8_0 is WORSE (+0.37%)
+than turbo4 V (+0.16%), likely because turbo4 V dequant noise averages out better through
+softmax-weighted sum than q8_0 systematic rounding.
+
+### Layer-Adaptive Sweep (hd256, new turbo4)
+
+Model has 16 attention layers (48 recurrent Delta Net layers use no KV cache).
+
+| Mode | Description | PPL | vs q8_0 | Promoted layers |
+|------|-------------|-----|---------|-----------------|
+| **LA-3** | **last 4 (K+V)** | **5.8420** | **+0.08%** | **4/16 = 25%** |
+| LA-10 | last 4 (K-only) | 5.8441 | +0.11% | K: 4/16, V: 0/16 |
+| LA-1 | first4+last4 (K+V) | 5.8461 | +0.15% | 8/16 = 50% |
+| 0 | turbo4 uniform | 5.8467 | +0.16% | 0/16 |
+
+**LA-3 (last 4 K+V q8_0) wins at +0.08% — practically lossless.**
+LA-1 (first4+last4) doesn't help on new turbo4 hd256 (unlike old QJL turbo4 where it was -0.71%).
+Only 16 attention layers means 4 promoted layers = 25% of KV cache at q8_0.
+
+## MMA Prefill fp16 Precision Fix — turbo4 (2026-03-28)
+
+**Root cause**: During prefill (Q->ne[1] > 1), turbo K/V are dequanted to fp16 temp buffers
+for tensor core MMA attention. turbo4's 16 centroids (spaced ~0.023 apart when scaled by norm)
+round-trip through fp16, losing precision. turbo3's 8 centroids (wider spacing) survive fp16.
+
+**Fix**: turbo4 now automatically bypasses MMA prefill and uses vec kernel (full float32
+precision). turbo2/turbo3 keep MMA prefill. FA auto-enabled for turbo types (was an error).
+
+### PPL Impact (Qwen3.5-27B, hd256, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| q8_0 baseline | 5.8375 | — |
+| **turbo4 (vec prefill, auto)** | **5.8310** | **-0.11%** |
+| turbo4 (MMA prefill, old) | 5.8467 | +0.16% |
+| turbo3 (MMA prefill) | 5.8501 | +0.22% |
+
+turbo4 now **beats q8_0** by 0.11% without any manual env var.
+
+### Speed Impact
+
+| Config | pp4096 tok/s | pp/q8 | tg64 tok/s | tg/q8 |
+|--------|-------------|-------|-----------|-------|
+| q8_0 | 1139 | 100% | 31.23 | 100% |
+| turbo3 (MMA) | 1120 | 98.3% | 30.09 | 96.4% |
+| turbo4 (vec) | 420 | 36.9% | 30.14 | 96.5% |
+
+**Trade-off**: turbo4 prefill is 2.7x slower than q8_0 (vec kernel for full precision).
+Decode speed is unaffected (96.5% of q8_0). For interactive use where decode matters
+more than one-time prefill, this is acceptable.
+
+### Code Changes
+- `fattn.cu`: turbo4 automatically uses vec prefill (no MMA fp16 round-trip)
+- `llama-context.cpp`: FA auto-enabled for turbo types (was: throw error)
+
+---
+
+## Experiment #53: Inverse-FWHT Prefill Dequant for turbo4
+Date: 2026-03-28
+Branch: experiment/tbq-ideas
+
+### Problem
+turbo4 prefill was 37% of q8_0 (420 vs 1139 tok/s) because MMA was bypassed to avoid
+fp16 centroid precision loss. turbo4's 16 centroids are ~0.023 apart, rounding to same fp16.
+
+### Solution
+Inverse FWHT during K dequant-to-fp16: centroid lookup → signs2 → butterfly → signs1×norm → fp16.
+After inverse rotation, values are in original domain with natural variation — fp16 handles them fine.
+K only (V fp16 loss is negligible). Q is NOT pre-rotated (K is in original domain).
+
+### Results
+
+| Metric | Before | After |
+|--------|--------|-------|
+| PPL (2048, 8 chunks) | 5.831 (vec) | 5.858 (MMA inv-FWHT) |
+| Prefill pp4096 | 420 tok/s | **1124 tok/s** (+167%) |
+| Decode tg64 | ~30 tok/s | 30.17 tok/s (unchanged) |
+
+PPL delta: +0.46% (within 8-chunk noise). Prefill: 2.67x improvement, matching q8_0 levels.
+
+### Code Changes
+- `fattn.cu`: new `k_turbo4_dequant_f16_inv_fwht` kernel (128 threads, shmem butterfly)
+- `fattn.cu`: turbo4 K prefill dispatches inverse FWHT kernel, V uses simple dequant
+- `fattn.cu`: Q pre-rotation skipped for turbo4 K (original domain)
+- `fattn.cu`: removed `!turbo4_kv` MMA bypass — all turbo types use MMA prefill

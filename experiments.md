@@ -410,20 +410,20 @@ Prefill pp4096 (tok/s):
 **What**: Per-channel mean subtraction before Hadamard. Two interpretations: (a) per-token mean of 128-element group = what #22 tested (no benefit — already near-zero after L2 norm), (b) per-channel mean across tokens (requires calibration or running statistics, incompatible with per-token SET_ROWS pipeline). Same fundamental issue as #39: random sign arrays already decorrelate the distribution, making pre-centering redundant.
 
 ### 41. CAT alignment correction / per-channel scaling
-**Status**: done — **CLOSED, theoretically cannot help**
+**Status**: done — **PARTIALLY WRONG: InnerQ DOES help on hd128 (see #52)**
 **Type**: quality
 **Papers**: CAT (arXiv:2603.04359, Mar 2026), InnerQ (arXiv:2602.23200, Feb 2026)
 **What**: CAT decomposes quantization error into concentration (outlier spread, what FWHT handles) and alignment (direction match, what FWHT does NOT handle). Alignment is INVARIANT to orthogonal rotations — FWHT cannot improve it.
 **Analysis** (2026-03-27):
-Our pipeline makes CAT-style interventions ineffective:
+Our pipeline makes CAT-style interventions ineffective on head_dim=256:
 1. **L2 normalization** removes per-channel magnitude → all vectors unit norm
 2. **FWHT with random signs** mixes all channels → each output position ≈ i.i.d. N(0, 1/128)
 3. **Per-channel scaling before FWHT**: destroyed by mixing (FWHT is a dense linear transform)
 4. **Per-channel scaling after FWHT**: meaningless — all positions have identical distribution
 5. **Lloyd-Max codebook** is already optimal for the resulting standardized Gaussian
 6. **Norm correction** already preserves L2 norm of reconstruction (handles magnitude alignment)
-The remaining error is purely angular (codebook discretization) and cannot be reduced without more bits or a fundamentally different codebook structure. The head_dim=128 quality gap (+2-4% PPL) is a sqrt(n) noise effect in dot products — fewer dimensions means larger relative error per attention score. This is inherent to the dimensionality, not a codebook/distribution mismatch that scaling could fix.
-**Closes research line**: #19 (channel reordering), #20 (SmoothRot), #39 (GSR Walsh), #40 (HadaNorm), #41 (CAT) all fail for the same root cause — random sign arrays + FWHT already make the distribution optimally uniform.
+**CORRECTION (2026-03-28)**: The analysis above is valid for head_dim=256, but on head_dim=128, per-channel scaling BEFORE L2 norm (i.e., before the pipeline above) DOES help. Channel magnitudes vary 20x on Qwen3-14B hd128 — normalizing channels before L2 norm changes the direction of the unit vector fed to FWHT, reducing quantization noise in the high-variance channels. This is what InnerQ (#52) implements. 55% gap closure on hd128.
+**Closes research line**: #19, #20, #39, #40 still fail. #41 was partially right — per-channel scaling works when applied BEFORE L2 norm (changing the vector direction), not after (which is meaningless post-normalization).
 **Difficulty**: Low (heuristic test) to Medium (full calibration).
 
 ### 42. KVLinC asymmetric K/V rotation strategy
@@ -496,6 +496,32 @@ if (turbo_k_any && Q->ne[0] % 128 == 0) {
 **Implementation**: 3 lines added to fattn-vec.cuh V accumulation loop (both V_DOT2 and non-V_DOT2 paths). Threshold check after loading KQ_k, `continue` before V dequant.
 **Results**: Zero quality loss (PPL bit-identical). On dense model, no speedup (attention <5% of compute). On MoE model, eliminates native dequant context scaling regression: 114.44→126.89 tok/s at 8K (+10.9%). Native dequant with sparse V now matches fp16 dequant speed at all contexts.
 **Implication**: The fp16 decode dequant path may become unnecessary — sparse V achieves the same context-scaling fix with zero extra memory bandwidth.
+
+### 52. InnerQ per-channel equalization (TODO-004)
+**Status**: done — **~46% gap closure on head_dim=128, auto-disables on hd256**
+**Type**: quality
+**Papers**: InnerQ (arXiv:2602.23200), CAT (arXiv:2603.04359)
+**Branch**: `experiment/innerq-channel-equalization`
+**What**: Per-channel scaling before L2 norm + FWHT to equalize channel magnitudes. Inverse scaling on Q in FA kernel. Online calibration (100K token-counts), sqrt-dampened scales with clamp. Auto-detects balanced channels (max ratio < 1.2) and disables.
+**Implementation**: Modified `turbo-quant-cuda.cuh` (device arrays, calibration with both RMS+max accumulators, K/V flag as kernel param, auto-detect), `fattn.cu` (inverse scaling in `k_turbo_fwht_forward`), `fattn-common.cuh` (inverse scale array), `set-rows.cu` (calibration state machine, K/V name detection).
+**Key design decisions tested**:
+  - K+V scaling beats K-only scaling (V direction adjustment helps even without output compensation)
+  - Mixed K+V calibration stats beat K-only stats (V distribution contributes useful info)
+  - Paper's max-based formula (`1/sqrt(max|K_i|)`) doesn't transfer to our codebook pipeline (PPL worse)
+  - RMS-based with strength=0.20 is optimal for turbo3+FWHT+norm-correction
+  - Auto-detect (max_ratio < 1.2 → disable) prevents harm on already-balanced hd256
+**Results** (Qwen3-14B Q5_K_M, head_dim=128, 2K/8chunks):
+  - turbo3 baseline: PPL 6.6340 (+3.33% vs q8_0 6.4206)
+  - turbo3 + InnerQ (strength=0.20, RMS, K+V): PPL 6.5349 (+1.78%) — **46% gap closure**
+  - K-only apply (strength=0.30): PPL 6.5418 (+1.89%) — 43% closure
+  - K-only apply (strength=0.20): PPL 6.5477 (+1.98%) — 40% closure
+  - Max-based mode=1 (paper's formula): PPL 6.6716 (+3.91%) — WORSE than baseline
+**Results** (Qwen3.5-27B Q6_K, head_dim=256, 2K/8chunks):
+  - turbo3 baseline: PPL 5.8501
+  - turbo3 + InnerQ (forced): PPL 5.9283 — HURTS (+1.3%)
+  - turbo3 + InnerQ (auto-detect): PPL 5.8501 — correctly disabled, no regression
+**Env vars**: `TURBO_INNERQ=1`, `TURBO_INNERQ_STRENGTH=0.20` (default 0.5), `TURBO_INNERQ_MODE=0` (0=RMS, 1=max)
+**Limitation**: Online calibration mismatch for first ~2K tokens (identity scales during calibration, final scales after). Run-to-run PPL variation of ~0.02 due to calibration timing noise.
 
 ### 46. BitDecoding-style dequant pipeline for turbo prefill
 **Status**: needs-research → experiment #16b
@@ -652,6 +678,20 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Paper**: arXiv:2510.05176 (Oct 2025, v2 Jan 2026). Online k-means (32 centroids/head), subtract nearest pattern, quantize residual only.
 **Results**: +1pt LongBench at INT2 over KIVI, +2.6pt GSM8K. Only 0.08% drop at INT4. +6.6% prefill latency, +2.6% decode latency.
 **Analysis (2026-03-27)**: LOW expected benefit for turbo3/turbo4 because FWHT rotation already flattens the distribution (exactly what PatternKV targets). PatternKV operates on raw asymmetric INT quant without any rotation, so the "peaked distribution with outliers" problem it solves is already handled by our pipeline. Pattern subtraction in rotated space would require rotating patterns too, and rotated-space values are already approximately Gaussian where Lloyd-Max codebook is near-optimal. The V cache adaptive threshold (75% utilization, catastrophic without it) adds fragile complexity. Would need to operate pre-FWHT on raw vectors, but then pattern centroids are head_dim=128/256 floats that must be stored per-head per-layer (32 * 128 * 4B = 16KB/head, 40 layers * 4 heads = 2.56MB for Qwen3.5-27B -- fits in constant memory). **Verdict: unlikely to beat our existing FWHT flattening, but a simplified 4-pattern version is low-risk to prototype.**
+
+### 53. Inverse-FWHT prefill dequant (from dusterbloom TBQ PR#2) `done`
+**Source**: PR #2 (dusterbloom). TBQ prefill does full inverse Hadamard + sign flip during dequant-to-fp16, producing original-domain fp16 values. Standard MMA then works with no Q rotation.
+**Why**: Our turbo4 prefill was 37% of q8_0 because we bypassed MMA to avoid fp16 centroid precision loss. TBQ's approach avoids the problem — the inverse FWHT mixes centroid values in float32 shared memory, only casting to fp16 after the transform.
+**Result**: turbo4 prefill 420 → **1124 tok/s** (+167%, matching q8_0). PPL 5.858 (+0.46% vs vec, within noise). Decode unchanged at 30.17 tok/s.
+**Design**: K-only inverse FWHT (V uses simple dequant, fp16 loss negligible). Q NOT pre-rotated (K in original domain). InnerQ inverse scaling applied in kernel. New kernel `k_turbo4_dequant_f16_inv_fwht` — 128 threads, shmem butterfly.
+
+### 54. Binary search quantization with pre-computed boundaries `done`
+**Source**: PR #2 (dusterbloom). Uses pre-computed Lloyd-Max decision boundaries with O(log n) binary search tree instead of linear codebook scan.
+**Result**: Already implemented — `turbo_find_nearest_4bit()` with `d_turbo_mid_4bit[15]` does 4 comparisons for 16 centroids. Nothing to do.
+
+### 55. N(0,1) centroid normalization (unnormalized Hadamard) `dropped`
+**Source**: PR #2 (dusterbloom). Uses unnormalized Hadamard so post-FWHT values are N(0,1). Centroids universal for any head_dim.
+**Result**: Functionally equivalent to our approach — the 1/√128 factor just moves between centroids and norm. No quality/speed benefit, breaking format change. Not worth it.
 
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.
