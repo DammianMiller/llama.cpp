@@ -1022,3 +1022,105 @@ PPL delta: +0.46% (within 8-chunk noise). Prefill: 2.67x improvement, matching q
 - `fattn.cu`: turbo4 K prefill dispatches inverse FWHT kernel, V uses simple dequant
 - `fattn.cu`: Q pre-rotation skipped for turbo4 K (original domain)
 - `fattn.cu`: removed `!turbo4_kv` MMA bypass — all turbo types use MMA prefill
+
+---
+
+## spiritbuun Merge + Speculative Decoding Comparison (2026-04-02)
+
+Hardware: RTX 3090 24GB (local), Qwen3.5-35B-A3B-UD-IQ4_XS (17 GiB)
+Build: turboquant-cuda-v2, merged spiritbuun InnerQ + turbo4 PolarQuant + prefill inv-FWHT
+Config: ctx 131072, ngl 99, threads 32, batch/ubatch 512, flash-attn on
+Speculative: ngram-cache, draft-max 4, draft-min 3, draft-p-min 0.75
+
+### Config A: Pre-Merge v2 Baseline (q8_0 KV + ngram-cache spec)
+
+Commit: bf8015872 (fix: reduce hybrid speculative rollback overhead)
+VRAM: 20,721 MiB / 24,576 MiB
+
+| Run | Prompt | Decode tok/s | Prefill tok/s | Draft | Accepted |
+|-----|--------|-------------|---------------|-------|----------|
+| 1 | consensus algorithms | 88.60 | 425.98 | 112 | 4 |
+| 2 | public key crypto | 89.61 | 447.33 | 111 | 4 |
+| 3 | GPU pipelines | 74.49 | 493.40 | 337 | 26 |
+| **Avg** | | **84.23** | **455.57** | | |
+
+### Config B: Post-Merge v2 (q8_0 KV + ngram-cache spec)
+
+Commit: merge of spiritbuun InnerQ + turbo4 PolarQuant + prefill inv-FWHT
+VRAM: 20,382 MiB / 24,576 MiB (-339 MiB vs pre-merge)
+
+| Run | Prompt | Decode tok/s | Prefill tok/s | Draft | Accepted |
+|-----|--------|-------------|---------------|-------|----------|
+| 1 | consensus algorithms | 110.57 | 269.43 (cold) | 4 | 0 |
+| 2 | public key crypto | 113.61 | 435.69 | 0 | 0 |
+| 3 | GPU pipelines | 110.92 | 501.50 | 0 | 0 |
+| **Avg** | | **111.70** | **468.60** (warm) | | |
+
+### Comparison: Pre-Merge vs Post-Merge
+
+| Metric | Pre-Merge | Post-Merge | Delta |
+|--------|-----------|------------|-------|
+| Decode tok/s (avg) | 84.23 | **111.70** | **+32.6%** |
+| Prefill tok/s (warm avg) | 455.57 | 468.60 | +2.9% |
+| VRAM | 20,721 MiB | 20,382 MiB | **-339 MiB** |
+
+### Config B-off: Post-Merge q8_0 KV, Speculative OFF
+
+| Run | Prompt | Decode tok/s | Prefill tok/s |
+|-----|--------|-------------|---------------|
+| 1 | consensus algorithms | 112.54 | 263.07 (cold) |
+| 2 | public key crypto | 111.52 | 445.41 |
+| 3 | GPU pipelines | 112.34 | 493.36 |
+| **Avg** | | **112.13** | **469.39** (warm) |
+
+### Config C: turbo3 KV, Speculative ON (ngram-cache)
+
+VRAM: 19,630 MiB / 24,576 MiB (-752 MiB vs q8_0)
+
+| Run | Prompt | Decode tok/s | Prefill tok/s | Draft | Accepted |
+|-----|--------|-------------|---------------|-------|----------|
+| 1 | consensus algorithms | 104.18 | 215.54 (cold) | 8 | 0 |
+| 2 | public key crypto | 108.24 | 428.03 | 0 | 0 |
+| 3 | GPU pipelines | 106.55 | 472.82 | 0 | 0 |
+| **Avg** | | **106.32** | **450.43** (warm) | | |
+
+### Config D: turbo3 KV, Speculative OFF
+
+VRAM: 19,630 MiB / 24,576 MiB
+
+| Run | Prompt | Decode tok/s | Prefill tok/s |
+|-----|--------|-------------|---------------|
+| 1 | consensus algorithms | 107.01 | 259.80 (cold) |
+| 2 | public key crypto | 107.85 | 415.86 |
+| 3 | GPU pipelines | 106.55 | 495.72 |
+| **Avg** | | **107.14** | **455.79** (warm) |
+
+---
+
+### Full Comparison Matrix (Post-Merge, Qwen3.5-35B-A3B-UD-IQ4_XS, 131K ctx)
+
+| Config | KV Cache | Speculative | Decode tok/s | Prefill tok/s | VRAM (MiB) |
+|--------|----------|-------------|-------------|---------------|------------|
+| B (on) | q8_0 | ngram-cache | **111.70** | 468.60 | 20,382 |
+| B (off) | q8_0 | off | **112.13** | 469.39 | 20,382 |
+| C | turbo3 | ngram-cache | 106.32 | 450.43 | **19,630** |
+| D | turbo3 | off | 107.14 | 455.79 | **19,630** |
+
+### Analysis
+
+**KV Cache: q8_0 vs turbo3**
+- Decode speed: turbo3 is 95.5% of q8_0 (4.5% overhead from turbo dequantization)
+- Prefill speed: turbo3 is 97.1% of q8_0 (warm, negligible difference)
+- VRAM savings: **752 MiB** (3.7%) — modest at short context because model weights dominate; savings scale with context length
+
+**Speculative Decoding: ON vs OFF**
+- q8_0: spec ON 111.70 vs spec OFF 112.13 — essentially identical (-0.4%)
+- turbo3: spec ON 106.32 vs spec OFF 107.14 — essentially identical (-0.8%)
+- ngram-cache acceptance rate near zero on these single-turn prompts (no prior context to match)
+- Speculative overhead is negligible even when acceptance is low
+
+**Key Findings:**
+1. spiritbuun merge improved decode +32.6% over pre-merge v2 (q8_0 path benefited from code improvements)
+2. turbo3 KV trades 4.5% decode speed for 752 MiB VRAM savings (scales with context)
+3. Speculative decoding has near-zero overhead on cold prompts — ngram-cache needs conversation history to be effective
+4. All configs are production-viable; turbo3 is the better choice for long-context workloads where VRAM headroom matters

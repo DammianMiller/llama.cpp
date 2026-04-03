@@ -1,0 +1,7 @@
+// PlanarQuant: K=PQ4_0, V=F16 (compress K-cache only)
+
+#include "../fattn-vec.cuh"
+
+DECL_FATTN_VEC_CASE( 64, GGML_TYPE_PQ4_0, GGML_TYPE_F16);
+DECL_FATTN_VEC_CASE(128, GGML_TYPE_PQ4_0, GGML_TYPE_F16);
+DECL_FATTN_VEC_CASE(256, GGML_TYPE_PQ4_0, GGML_TYPE_F16);

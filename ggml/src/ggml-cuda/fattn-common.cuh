@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "planarquant.cuh"
 
 #include <cstdint>
 
@@ -809,6 +810,197 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(
     } else { static_assert(std::is_same_v<T, void>, "bad type"); }
 }
 
+// PlanarQuant PQ4_0: V-cache dequantization with inverse Givens rotation
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_pq4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_pq4_0 * x = (const block_pq4_0 *) vx;
+
+    const int64_t ib  = i0 / QK_PQ;  // block index
+    const int     iq  = (i0 % QK_PQ) / 2;  // pair index within block
+    const float   d   = __half2float(x[ib].d);  // norm
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+#pragma unroll
+    for (int p = 0; p < ne / 2; p++) {
+        const int pair = iq + p;
+        const uint8_t packed = x[ib].qs[pair];
+        const uint8_t idx_a = packed & 0x0F;
+        const uint8_t idx_b = packed >> 4;
+
+        float ca = pq4_centroids[idx_a];
+        float cb = pq4_centroids[idx_b];
+
+        // Inverse Givens rotation
+        float cos_r, sin_r;
+        pq4_get_rotation(pair, QK_PQ, cos_r, sin_r);
+
+        float a = (cos_r * ca - sin_r * cb) * d;
+        float b = (sin_r * ca + cos_r * cb) * d;
+
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+            ((half2 *) dst)[p] = make_half2(__float2half(a), __float2half(b));
+        } else
+#endif // FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[2*p]     = a;
+            ((float *) dst)[2*p + 1] = b;
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported type");
+        }
+    }
+}
+
+// PlanarQuant PQ4_0: K-cache dot product (dequantize + dot with Q)
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_pq4_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_pq4_0 * K_pq = (const block_pq4_0 *) K_c;
+    const half * Q_h = (const half *) Q_v;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    // PQ4_0 has block size 128 so for D=128 there's exactly 1 block.
+    // For D=64 or D=256, adjust accordingly.
+    // Each thread processes some pairs and we reduce.
+    float sum = 0.0f;
+
+    // Process pairs, each thread takes a stride
+    for (int pair_0 = 0; pair_0 < D / 2; pair_0 += nthreads) {
+        const int pair = pair_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        if (pair >= D / 2) break;
+
+        // Which block and offset within block
+        const int ib = (2 * pair) / QK_PQ;
+        const int ip = pair % (QK_PQ / 2);
+
+        const uint8_t packed = K_pq[ib].qs[ip];
+        const uint8_t idx_a = packed & 0x0F;
+        const uint8_t idx_b = packed >> 4;
+
+        float cos_r, sin_r;
+        pq4_get_rotation(ip, QK_PQ, cos_r, sin_r);
+
+        float ca = pq4_centroids[idx_a];
+        float cb = pq4_centroids[idx_b];
+
+        float k_a = cos_r * ca - sin_r * cb;
+        float k_b = sin_r * ca + cos_r * cb;
+
+        float norm = __half2float(K_pq[ib].d);
+        k_a *= norm;
+        k_b *= norm;
+
+        float q_a = __half2float(Q_h[2 * pair]);
+        float q_b = __half2float(Q_h[2 * pair + 1]);
+
+        sum += k_a * q_a + k_b * q_b;
+    }
+
+    return sum;
+}
+
+// PlanarQuant PQ3_0: 3-bit bitstream unpacking helpers (device-side)
+static __device__ __forceinline__ uint8_t pq3_unpack_device(const uint8_t * qs, int idx) {
+    int bit_pos = idx * 3;
+    int byte_pos = bit_pos / 8;
+    int bit_off = bit_pos % 8;
+    if (bit_off <= 5) {
+        return (qs[byte_pos] >> bit_off) & 0x7;
+    }
+    return ((qs[byte_pos] >> bit_off) | (qs[byte_pos + 1] << (8 - bit_off))) & 0x7;
+}
+
+// PlanarQuant PQ3_0: V-cache dequantization
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_pq3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_pq3_0 * x = (const block_pq3_0 *) vx;
+
+    const int64_t ib  = i0 / QK_PQ;
+    const int     iq  = (i0 % QK_PQ) / 2;
+    const float   d   = __half2float(x[ib].d);
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+#pragma unroll
+    for (int p = 0; p < ne / 2; p++) {
+        const int pair = iq + p;
+        const int elem0 = 2 * pair;
+        const int elem1 = 2 * pair + 1;
+        const uint8_t idx_a = pq3_unpack_device(x[ib].qs, elem0);
+        const uint8_t idx_b = pq3_unpack_device(x[ib].qs, elem1);
+
+        float ca = pq3_centroids[idx_a];
+        float cb = pq3_centroids[idx_b];
+
+        float cos_r, sin_r;
+        pq4_get_rotation(pair, QK_PQ, cos_r, sin_r);
+
+        float a = (cos_r * ca - sin_r * cb) * d;
+        float b = (sin_r * ca + cos_r * cb) * d;
+
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+            ((half2 *) dst)[p] = make_half2(__float2half(a), __float2half(b));
+        } else
+#endif
+        if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[2*p]     = a;
+            ((float *) dst)[2*p + 1] = b;
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported type");
+        }
+    }
+}
+
+// PlanarQuant PQ3_0: K-cache dot product
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_pq3_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_pq3_0 * K_pq = (const block_pq3_0 *) K_c;
+    const half * Q_h = (const half *) Q_v;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    float sum = 0.0f;
+
+    for (int pair_0 = 0; pair_0 < D / 2; pair_0 += nthreads) {
+        const int pair = pair_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        if (pair >= D / 2) break;
+
+        const int ib = (2 * pair) / QK_PQ;
+        const int ip = pair % (QK_PQ / 2);
+
+        const int elem0 = 2 * ip;
+        const int elem1 = 2 * ip + 1;
+        const uint8_t idx_a = pq3_unpack_device(K_pq[ib].qs, elem0);
+        const uint8_t idx_b = pq3_unpack_device(K_pq[ib].qs, elem1);
+
+        float cos_r, sin_r;
+        pq4_get_rotation(ip, QK_PQ, cos_r, sin_r);
+
+        float ca = pq3_centroids[idx_a];
+        float cb = pq3_centroids[idx_b];
+
+        float k_a = cos_r * ca - sin_r * cb;
+        float k_b = sin_r * ca + cos_r * cb;
+
+        float norm = __half2float(K_pq[ib].d);
+        k_a *= norm;
+        k_b *= norm;
+
+        float q_a = __half2float(Q_h[2 * pair]);
+        float q_b = __half2float(Q_h[2 * pair + 1]);
+
+        sum += k_a * q_a + k_b * q_b;
+    }
+
+    return sum;
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -829,6 +1021,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_turbo3_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
         return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_PQ4_0) {
+        return vec_dot_fattn_vec_KQ_pq4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_PQ3_0) {
+        return vec_dot_fattn_vec_KQ_pq3_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -855,6 +1051,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_turbo3_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
         return dequantize_V_turbo4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_PQ4_0) {
+        return dequantize_V_pq4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_PQ3_0) {
+        return dequantize_V_pq3_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

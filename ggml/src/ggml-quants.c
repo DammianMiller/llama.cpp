@@ -5414,3 +5414,219 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 
     return true;
 }
+
+// =========================== PlanarQuant PQ4_0 ===========================
+
+// PlanarQuant rotation parameters: precomputed static tables in ggml-common.h
+// pq_rot_cos[64] and pq_rot_sin[64] for QK_PQ=128 (64 pairs)
+
+static inline uint8_t pq4_nearest_centroid(float val) {
+    uint8_t best = 0;
+    float best_dist = fabsf(val - pq4_centroids[0]);
+    for (int i = 1; i < 16; i++) {
+        float dist = fabsf(val - pq4_centroids[i]);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = (uint8_t)i;
+        }
+    }
+    return best;
+}
+
+void quantize_row_pq4_0_ref(const float * GGML_RESTRICT x, block_pq4_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_PQ == 0);
+
+    const int nb = k / QK_PQ;
+
+    const float * cos_rot = pq_rot_cos;
+    const float * sin_rot = pq_rot_sin;
+
+    for (int i = 0; i < nb; i++) {
+        const float * xi = x + i * QK_PQ;
+
+        // Compute L2 norm
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_PQ; j++) {
+            sum_sq += xi[j] * xi[j];
+        }
+        float norm = sqrtf(sum_sq);
+        y[i].d = GGML_FP32_TO_FP16(norm);
+
+        // Normalize
+        float x_hat[QK_PQ];
+        if (norm > 1e-30f) {
+            float inv_norm = 1.0f / norm;
+            for (int j = 0; j < QK_PQ; j++) {
+                x_hat[j] = xi[j] * inv_norm;
+            }
+        } else {
+            for (int j = 0; j < QK_PQ; j++) {
+                x_hat[j] = 0.0f;
+            }
+        }
+
+        // Apply Givens rotations to pairs (2j, 2j+1) and quantize
+        for (int j = 0; j < QK_PQ / 2; j++) {
+            float a = x_hat[2*j];
+            float b = x_hat[2*j + 1];
+
+            float a_rot =  cos_rot[j] * a + sin_rot[j] * b;
+            float b_rot = -sin_rot[j] * a + cos_rot[j] * b;
+
+            uint8_t idx_a = pq4_nearest_centroid(a_rot);
+            uint8_t idx_b = pq4_nearest_centroid(b_rot);
+
+            y[i].qs[j] = idx_a | (idx_b << 4);
+        }
+    }
+}
+
+void dequantize_row_pq4_0(const block_pq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_PQ == 0);
+
+    const int nb = k / QK_PQ;
+
+    const float * cos_rot = pq_rot_cos;
+    const float * sin_rot = pq_rot_sin;
+
+    for (int i = 0; i < nb; i++) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        float * yi = y + i * QK_PQ;
+
+        for (int j = 0; j < QK_PQ / 2; j++) {
+            uint8_t idx_a = x[i].qs[j] & 0x0F;
+            uint8_t idx_b = x[i].qs[j] >> 4;
+
+            float ca = pq4_centroids[idx_a];
+            float cb = pq4_centroids[idx_b];
+
+            // Inverse Givens rotation (negate sin)
+            float a = cos_rot[j] * ca - sin_rot[j] * cb;
+            float b = sin_rot[j] * ca + cos_rot[j] * cb;
+
+            yi[2*j]     = a * norm;
+            yi[2*j + 1] = b * norm;
+        }
+    }
+}
+
+// =========================== PlanarQuant PQ3_0 ===========================
+
+// 3-bit bitstream packing helpers.
+// Pack: write 3-bit value at bit position (idx * 3) in the byte array.
+// Unpack: read 3-bit value at bit position (idx * 3) from the byte array.
+
+static inline void pq3_pack_index(uint8_t * qs, int idx, uint8_t val) {
+    int bit_pos = idx * 3;
+    int byte_pos = bit_pos / 8;
+    int bit_off = bit_pos % 8;
+    // Clear and set bits -- may span two bytes
+    qs[byte_pos] = (qs[byte_pos] & ~(0x7 << bit_off)) | ((val & 0x7) << bit_off);
+    if (bit_off > 5) {
+        // Spills into next byte
+        qs[byte_pos + 1] = (qs[byte_pos + 1] & ~(0x7 >> (8 - bit_off))) | ((val & 0x7) >> (8 - bit_off));
+    }
+}
+
+static inline uint8_t pq3_unpack_index(const uint8_t * qs, int idx) {
+    int bit_pos = idx * 3;
+    int byte_pos = bit_pos / 8;
+    int bit_off = bit_pos % 8;
+    if (bit_off <= 5) {
+        return (qs[byte_pos] >> bit_off) & 0x7;
+    }
+    // Spans two bytes
+    return ((qs[byte_pos] >> bit_off) | (qs[byte_pos + 1] << (8 - bit_off))) & 0x7;
+}
+
+static inline uint8_t pq3_nearest_centroid(float val) {
+    uint8_t best = 0;
+    float best_dist = fabsf(val - pq3_centroids[0]);
+    for (int i = 1; i < 8; i++) {
+        float dist = fabsf(val - pq3_centroids[i]);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = (uint8_t)i;
+        }
+    }
+    return best;
+}
+
+void quantize_row_pq3_0_ref(const float * GGML_RESTRICT x, block_pq3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_PQ == 0);
+
+    const int nb = k / QK_PQ;
+
+    const float * cos_rot = pq_rot_cos;
+    const float * sin_rot = pq_rot_sin;
+
+    for (int i = 0; i < nb; i++) {
+        const float * xi = x + i * QK_PQ;
+
+        // Compute L2 norm
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_PQ; j++) {
+            sum_sq += xi[j] * xi[j];
+        }
+        float norm = sqrtf(sum_sq);
+        y[i].d = GGML_FP32_TO_FP16(norm);
+
+        // Normalize
+        float x_hat[QK_PQ];
+        if (norm > 1e-30f) {
+            float inv_norm = 1.0f / norm;
+            for (int j = 0; j < QK_PQ; j++) {
+                x_hat[j] = xi[j] * inv_norm;
+            }
+        } else {
+            memset(x_hat, 0, sizeof(x_hat));
+        }
+
+        // Zero the packed indices buffer (48 bytes + 2 extra for safe 16-bit writes)
+        memset(y[i].qs, 0, QK_PQ * 3 / 8);
+
+        // Apply Givens rotations and quantize to 3-bit
+        for (int j = 0; j < QK_PQ / 2; j++) {
+            float a = x_hat[2*j];
+            float b = x_hat[2*j + 1];
+
+            float a_rot =  cos_rot[j] * a + sin_rot[j] * b;
+            float b_rot = -sin_rot[j] * a + cos_rot[j] * b;
+
+            uint8_t idx_a = pq3_nearest_centroid(a_rot);
+            uint8_t idx_b = pq3_nearest_centroid(b_rot);
+
+            pq3_pack_index(y[i].qs, 2*j,     idx_a);
+            pq3_pack_index(y[i].qs, 2*j + 1, idx_b);
+        }
+    }
+}
+
+void dequantize_row_pq3_0(const block_pq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_PQ == 0);
+
+    const int nb = k / QK_PQ;
+
+    const float * cos_rot = pq_rot_cos;
+    const float * sin_rot = pq_rot_sin;
+
+    for (int i = 0; i < nb; i++) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        float * yi = y + i * QK_PQ;
+
+        for (int j = 0; j < QK_PQ / 2; j++) {
+            uint8_t idx_a = pq3_unpack_index(x[i].qs, 2*j);
+            uint8_t idx_b = pq3_unpack_index(x[i].qs, 2*j + 1);
+
+            float ca = pq3_centroids[idx_a];
+            float cb = pq3_centroids[idx_b];
+
+            // Inverse Givens rotation
+            float a = cos_rot[j] * ca - sin_rot[j] * cb;
+            float b = sin_rot[j] * ca + cos_rot[j] * cb;
+
+            yi[2*j]     = a * norm;
+            yi[2*j + 1] = b * norm;
+        }
+    }
+}

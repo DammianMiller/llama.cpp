@@ -431,7 +431,9 @@ extern "C" {
         GGML_TYPE_TURBO3_0 = 41, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
         GGML_TYPE_TURBO4_0 = 42, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
         GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: 2-bit PolarQuant, no QJL
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_PQ4_0   = 44, // PlanarQuant 4-bit (Givens rotation + Lloyd-Max)
+        GGML_TYPE_PQ3_0   = 45, // PlanarQuant 3-bit (Givens rotation + Lloyd-Max)
+        GGML_TYPE_COUNT   = 46,
     };
 
     // precision

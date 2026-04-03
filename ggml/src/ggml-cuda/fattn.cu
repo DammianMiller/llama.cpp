@@ -557,6 +557,18 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,   GGML_TYPE_PQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,  GGML_TYPE_PQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,  GGML_TYPE_PQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_PQ4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_PQ4_0, GGML_TYPE_PQ4_0)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,   GGML_TYPE_PQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,  GGML_TYPE_PQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,  GGML_TYPE_PQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_PQ3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_PQ3_0, GGML_TYPE_PQ3_0)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
@@ -574,6 +586,18 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,   GGML_TYPE_PQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,  GGML_TYPE_PQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,  GGML_TYPE_PQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_PQ4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_PQ4_0, GGML_TYPE_PQ4_0)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,   GGML_TYPE_PQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,  GGML_TYPE_PQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,  GGML_TYPE_PQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_PQ3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_PQ3_0, GGML_TYPE_PQ3_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -661,6 +685,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
+        case GGML_TYPE_PQ4_0:
+        case GGML_TYPE_PQ3_0:
 #ifndef GGML_CUDA_FA_ALL_QUANTS
             return BEST_FATTN_KERNEL_NONE;
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -690,6 +716,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // PlanarQuant types only have native support in the vec kernel, not MMA/TILE:
+    const bool pq_type = K->type == GGML_TYPE_PQ4_0 || K->type == GGML_TYPE_PQ3_0 ||
+                          V->type == GGML_TYPE_PQ4_0 || V->type == GGML_TYPE_PQ3_0;
+    if (pq_type) {
+        return can_use_vector_kernel ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {

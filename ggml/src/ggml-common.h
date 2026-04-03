@@ -474,6 +474,20 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
+// PlanarQuant: Givens rotation + Lloyd-Max scalar quantization for KV cache compression
+#define QK_PQ 128
+typedef struct {
+    ggml_half d;            // L2 norm of original vector (FP16)
+    uint8_t qs[QK_PQ / 2]; // 4-bit centroid indices, nibble-packed (64 bytes)
+} block_pq4_0;
+static_assert(sizeof(block_pq4_0) == sizeof(ggml_half) + QK_PQ / 2, "wrong pq4_0 block size/padding");
+
+typedef struct {
+    ggml_half d;                  // L2 norm of original vector (FP16)
+    uint8_t qs[QK_PQ * 3 / 8];   // 3-bit centroid indices, bitstream-packed (48 bytes)
+} block_pq3_0;
+static_assert(sizeof(block_pq3_0) == sizeof(ggml_half) + QK_PQ * 3 / 8, "wrong pq3_0 block size/padding");
+
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 
@@ -1140,6 +1154,42 @@ GGML_TABLE_END()
 // ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
 GGML_TABLE_BEGIN(int8_t, kvalues_mxfp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+GGML_TABLE_END()
+
+// PlanarQuant Lloyd-Max centroids for N(0, 1/128) marginal distribution
+GGML_TABLE_BEGIN(float, pq4_centroids, 16)
+    -0.24148819f, -0.18283082f, -0.14296932f, -0.11099178f,
+    -0.08325349f, -0.05802021f, -0.03428025f, -0.01134224f,
+     0.01134224f,  0.03428025f,  0.05802021f,  0.08325349f,
+     0.11099178f,  0.14296932f,  0.18283082f,  0.24148819f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, pq3_centroids, 8)
+    -0.19020693f, -0.11878592f, -0.06682206f, -0.02166347f,
+     0.02166347f,  0.06682206f,  0.11878592f,  0.19020693f,
+GGML_TABLE_END()
+
+// Precomputed Givens rotation cos/sin for QK_PQ=128 (64 pairs)
+GGML_TABLE_BEGIN(float, pq_rot_cos, 64)
+    -0.99884123f, -0.84967582f,  0.25201561f,  0.97925307f,  0.46344995f, -0.83613732f,  0.85414927f,  0.21155679f,
+     0.09231916f,  0.63974610f,  0.28621767f,  0.93071629f, -0.31861612f,  0.97483009f,  0.87997397f,  0.83334720f,
+     0.80493090f,  0.48367688f,  0.41366457f,  0.52957364f,  0.83919794f, -0.99933147f, -0.23161665f,  0.72720264f,
+     0.46037781f,  0.99695352f, -0.38519777f, -0.07125320f,  0.18940147f, -0.38248551f,  0.99289545f, -0.23079612f,
+     0.79780962f,  0.54579327f, -0.05861493f, -0.96225035f, -0.90760693f,  0.37782692f,  0.08545515f,  0.31239487f,
+     0.33798978f, -0.33578558f, -0.79412709f,  0.17421732f,  0.94074481f,  0.73940241f,  0.99997072f,  0.95013434f,
+    -0.93725077f, -0.93920192f, -0.19315862f, -0.52189575f,  0.13396391f,  0.69118814f, -0.75892930f, -0.87488393f,
+    -0.99926647f, -0.60104698f,  0.99637583f, -0.92926424f, -0.45667522f, -0.06366356f,  0.95575113f,  0.99976234f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, pq_rot_sin, 64)
+    -0.04812690f,  0.52730542f, -0.96772317f,  0.20264115f, -0.88612310f, -0.54852018f,  0.52002791f,  0.97736571f,
+    -0.99572947f, -0.76858632f,  0.95816462f,  0.36574197f,  0.94788384f,  0.22294909f, -0.47502191f,  0.55274989f,
+    -0.59336856f, -0.87524663f, -0.91042936f, -0.84826397f, -0.54382609f, -0.03655984f,  0.97280714f,  0.68642285f,
+    -0.88772308f,  0.07799792f,  0.92283405f, -0.99745826f, -0.98189973f, -0.92396149f,  0.11899003f, -0.97300213f,
+    -0.60290945f, -0.83791987f,  0.99828067f, -0.27216588f,  0.41982099f, -0.92587624f, -0.99634202f,  0.94995234f,
+    -0.94114978f,  0.94193845f, -0.60775173f, -0.98470723f, -0.33911532f,  0.67326374f, -0.00765223f,  0.31184090f,
+    -0.34865597f, -0.34336534f, -0.98116754f,  0.85300928f,  0.99098621f,  0.72267486f, -0.65117303f,  0.48433265f,
+    -0.03829521f,  0.79921370f,  0.08505999f,  0.36941571f,  0.88963349f, -0.99797142f,  0.29417643f, -0.02180057f,
 GGML_TABLE_END()
 
 #define NGRID_IQ1S 2048

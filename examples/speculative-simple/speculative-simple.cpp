@@ -70,6 +70,8 @@ int main(int argc, char ** argv) {
         }
 
         params_dft.tensor_buft_overrides = params.speculative.tensor_buft_overrides;
+        params_dft.cache_type_k          = params_spec.cache_type_k;
+        params_dft.cache_type_v          = params_spec.cache_type_v;
 
         auto mparams_dft = common_model_params_to_llama(params_dft);
 

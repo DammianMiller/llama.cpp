@@ -1231,3 +1231,11 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+void quantize_row_pq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_pq4_0_ref(x, (block_pq4_0 *) y, k);
+}
+
+void quantize_row_pq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_pq3_0_ref(x, (block_pq3_0 *) y, k);
+}

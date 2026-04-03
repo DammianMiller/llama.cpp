@@ -1,0 +1,7 @@
+// PlanarQuant 3-bit: K=F16, V=PQ3_0 (primary use case: compress V-cache)
+
+#include "../fattn-vec.cuh"
+
+DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F16, GGML_TYPE_PQ3_0);
+DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_PQ3_0);
+DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_PQ3_0);
