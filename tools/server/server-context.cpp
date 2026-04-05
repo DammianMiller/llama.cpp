@@ -87,6 +87,13 @@ struct server_slot {
     // ref: https://github.com/ggml-org/llama.cpp/pull/17808
     std::vector<int32_t> i_batch_dft;
 
+    // Deferred activation replay for hybrid models: after speculative rollback,
+    // instead of doing a separate llama_decode for the accepted tokens, defer
+    // them to be prepended to the NEXT batch. This amortizes the decode-call
+    // overhead and recovers the theoretical speculative decoding speedup.
+    llama_tokens pending_replay_tokens;
+    llama_pos    pending_replay_start_pos = -1;
+
     std::vector<completion_token_output> generated_token_probs;
 
     bool has_next_token = true;
@@ -179,6 +186,8 @@ struct server_slot {
 
         drafted.clear();
         i_batch_dft.clear();
+        pending_replay_tokens.clear();
+        pending_replay_start_pos = -1;
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -2086,6 +2095,21 @@ private:
                     draft.resize(n_draft_max);
                 }
 
+                // Prepend deferred replay tokens (from previous speculative rollback)
+                // BEFORE the sampled token. These advance the SSM state and fill in
+                // attention KV for accepted-but-not-yet-replayed positions.
+                // logits=false since we already know their values (already accepted).
+                if (!slot.pending_replay_tokens.empty()) {
+                    for (size_t ri = 0; ri < slot.pending_replay_tokens.size(); ++ri) {
+                        common_batch_add(batch,
+                            slot.pending_replay_tokens[ri],
+                            slot.pending_replay_start_pos + (llama_pos)ri,
+                            { slot.id }, false);
+                    }
+                    slot.pending_replay_tokens.clear();
+                    slot.pending_replay_start_pos = -1;
+                }
+
                 // add the sampled token to the batch
                 slot.i_batch_dft.push_back(batch.n_tokens);
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
@@ -2110,7 +2134,19 @@ private:
                     slot.drafted = std::move(draft);
                 }
             } else {
-                // no speculative decoding
+                // no speculative decoding — but still prepend any pending replay
+                // (can happen if speculation was just disabled between turns)
+                if (!slot.pending_replay_tokens.empty()) {
+                    for (size_t ri = 0; ri < slot.pending_replay_tokens.size(); ++ri) {
+                        common_batch_add(batch,
+                            slot.pending_replay_tokens[ri],
+                            slot.pending_replay_start_pos + (llama_pos)ri,
+                            { slot.id }, false);
+                    }
+                    slot.pending_replay_tokens.clear();
+                    slot.pending_replay_start_pos = -1;
+                }
+
                 slot.i_batch = batch.n_tokens;
 
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
@@ -2906,12 +2942,13 @@ private:
 
                 llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
 
-                // Activation replay for hybrid models: seq_rm may have restored the
-                // recurrent checkpoint to an earlier position than the target rollback,
-                // leaving the attention KV cache trimmed to match. Re-decode tokens
-                // from (cache_pos + 1) to target to bring both caches in sync.
-                // Uses slot.prompt.tokens as authoritative source to prevent underflow.
-                // Implements 'activation replay' from Snakes & Ladders (NeurIPS 2024).
+                // Deferred activation replay for hybrid models: seq_rm may have
+                // restored the recurrent checkpoint to an earlier position than
+                // the target rollback, leaving the attention KV cache trimmed to
+                // match. Instead of re-decoding immediately (expensive per-call
+                // overhead), defer the replay tokens to be prepended to the NEXT
+                // batch's forward pass. This amortizes the decode-call overhead
+                // and recovers the theoretical speculative decoding speedup.
                 {
                     const llama_model * mdl = llama_get_model(ctx);
                     if (mdl && llama_model_is_hybrid(mdl)) {
@@ -2920,28 +2957,17 @@ private:
 
                         if (cache_pos >= 0 && cache_pos < expected_pos) {
                             const int n_replay = (int)(expected_pos - cache_pos);
-                            // Safety: never replay more tokens than exist in the prompt
                             if (n_replay > 0 && (size_t)(cache_pos + n_replay) < slot.prompt.tokens.size()) {
-                                SLT_DBG(slot, "hybrid activation replay: %d tokens from prompt (cache=%d, target=%d)\n",
+                                SLT_DBG(slot, "hybrid deferred replay: queue %d tokens (cache=%d, target=%d)\n",
                                     n_replay, (int)cache_pos, (int)expected_pos);
 
-                                llama_batch replay_batch = llama_batch_init(n_replay, 0, 1);
-                                replay_batch.n_tokens = n_replay;
+                                slot.pending_replay_tokens.clear();
+                                slot.pending_replay_tokens.reserve(n_replay);
                                 for (int ri = 0; ri < n_replay; ri++) {
                                     const int prompt_idx = (int)(cache_pos + 1) + ri;
-                                    replay_batch.token[ri]     = slot.prompt.tokens[prompt_idx];
-                                    replay_batch.pos[ri]       = cache_pos + 1 + ri;
-                                    replay_batch.n_seq_id[ri]  = 1;
-                                    replay_batch.seq_id[ri][0] = slot.id;
-                                    replay_batch.logits[ri]    = (ri == n_replay - 1) ? 1 : 0;
+                                    slot.pending_replay_tokens.push_back(slot.prompt.tokens[prompt_idx]);
                                 }
-
-                                const int ret = llama_decode(ctx, replay_batch);
-                                llama_batch_free(replay_batch);
-
-                                if (ret != 0) {
-                                    SLT_WRN(slot, "activation replay failed (ret=%d)\n", ret);
-                                }
+                                slot.pending_replay_start_pos = cache_pos + 1;
                             }
                         }
                     }
