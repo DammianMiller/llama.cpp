@@ -93,6 +93,39 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             break;
         }
 
+        // Save recurrent checkpoint BEFORE processing speculative batches.
+        // This is CPU-side (tensor data copied GPU->CPU via ggml_backend_tensor_get)
+        // so no GPU memory impact. Required because SSM state cannot be rolled back
+        // positionally — we must snapshot the state before mutation.
+        //
+        // Only checkpoint for short multi-token batches (likely speculative) to
+        // avoid overhead during prompt prefill.
+        {
+            std::unordered_set<llama_seq_id> seqs_to_checkpoint;
+            constexpr uint32_t max_spec_checkpoint_tokens = 64;
+
+            for (const auto & ub : ubatches) {
+                if (ub.n_tokens <= 1 || ub.n_tokens > max_spec_checkpoint_tokens) {
+                    continue;
+                }
+                if (ub.seq_id == nullptr || ub.n_seq_id == nullptr) {
+                    continue;
+                }
+                for (uint32_t s = 0; s < ub.n_seqs; ++s) {
+                    const uint32_t i = s*ub.n_seq_tokens;
+                    if (ub.n_seq_id[i] == 0) {
+                        continue;
+                    }
+                    const llama_seq_id seq_id = ub.seq_id[i][0];
+                    seqs_to_checkpoint.insert(seq_id);
+                }
+            }
+
+            for (const auto seq_id : seqs_to_checkpoint) {
+                save_recurrent_checkpoint(seq_id);
+            }
+        }
+
         // prepare the recurrent batches first
         if (!mem_recr->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
@@ -275,19 +308,23 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return false;
         }
 
+        // Look up checkpoint saved upfront in init_batch() BEFORE batch mutation.
+        // Accept any checkpoint at position <= p0-1. The server's activation replay
+        // will re-decode tokens from checkpoint position forward to reach p0-1.
         auto it = cpu_checkpoints.find(seq_id);
-        if (it == cpu_checkpoints.end() || !it->second.valid || it->second.pos != p0 - 1) {
-            save_recurrent_checkpoint(seq_id);
-            it = cpu_checkpoints.find(seq_id);
-        }
 
-        if (it != cpu_checkpoints.end() && it->second.valid && it->second.pos == p0 - 1) {
+        if (it != cpu_checkpoints.end() && it->second.valid && it->second.pos <= p0 - 1) {
             if (!restore_recurrent_checkpoint(seq_id)) {
                 return false;
             }
+            // Trim attention KV to match checkpoint position. Server's activation
+            // replay re-decodes tokens from (ckpt.pos + 1) to (p0 - 1) to sync
+            // both caches back to the target rollback position.
+            const llama_pos attn_trim_from = it->second.pos + 1;
+            return mem_attn->seq_rm(seq_id, attn_trim_from, p1);
         } else {
             // Fallback: keep recurrent positions aligned with attention cache even if
-            // we don't have an exact checkpoint for p0 - 1.
+            // we don't have a usable checkpoint.
             bool aligned = false;
             for (auto & cell : mem_recr->cells) {
                 if (cell.has_seq_id(seq_id) && cell.pos >= p0) {
