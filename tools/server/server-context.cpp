@@ -2906,6 +2906,46 @@ private:
 
                 llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
 
+                // Activation replay for hybrid models: seq_rm may have restored the
+                // recurrent checkpoint to an earlier position than the target rollback,
+                // leaving the attention KV cache trimmed to match. Re-decode tokens
+                // from (cache_pos + 1) to target to bring both caches in sync.
+                // Uses slot.prompt.tokens as authoritative source to prevent underflow.
+                // Implements 'activation replay' from Snakes & Ladders (NeurIPS 2024).
+                {
+                    const llama_model * mdl = llama_get_model(ctx);
+                    if (mdl && llama_model_is_hybrid(mdl)) {
+                        const llama_pos cache_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id);
+                        const llama_pos expected_pos = (llama_pos)slot.prompt.n_tokens() - 1;
+
+                        if (cache_pos >= 0 && cache_pos < expected_pos) {
+                            const int n_replay = (int)(expected_pos - cache_pos);
+                            if (n_replay > 0 && (size_t)(cache_pos + n_replay) < slot.prompt.tokens.size()) {
+                                SLT_DBG(slot, "hybrid activation replay: %d tokens from prompt (cache=%d, target=%d)\n",
+                                    n_replay, (int)cache_pos, (int)expected_pos);
+
+                                llama_batch replay_batch = llama_batch_init(n_replay, 0, 1);
+                                replay_batch.n_tokens = n_replay;
+                                for (int ri = 0; ri < n_replay; ri++) {
+                                    const int prompt_idx = (int)(cache_pos + 1) + ri;
+                                    replay_batch.token[ri]     = slot.prompt.tokens[prompt_idx];
+                                    replay_batch.pos[ri]       = cache_pos + 1 + ri;
+                                    replay_batch.n_seq_id[ri]  = 1;
+                                    replay_batch.seq_id[ri][0] = slot.id;
+                                    replay_batch.logits[ri]    = (ri == n_replay - 1) ? 1 : 0;
+                                }
+
+                                const int ret = llama_decode(ctx, replay_batch);
+                                llama_batch_free(replay_batch);
+
+                                if (ret != 0) {
+                                    SLT_WRN(slot, "activation replay failed (ret=%d)\n", ret);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;
 
