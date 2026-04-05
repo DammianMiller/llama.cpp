@@ -86,6 +86,11 @@ public:
 private:
     const llama_hparams & hparams;
 
+    // Whether the attention KV cache uses unified mode (shared across sequences).
+    // When true, split_equal can use non-sequential mode which supports coupled
+    // sequences (multiple seq_ids per token) needed for tree speculation.
+    const bool is_unified;
+
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
 

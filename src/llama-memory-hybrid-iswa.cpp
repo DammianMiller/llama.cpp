@@ -30,6 +30,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr) :
     hparams(model.hparams),
+    is_unified(unified),
     mem_attn(new llama_kv_cache_iswa(
         model,
         type_k,
@@ -73,9 +74,9 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
-                // TODO: non-sequential equal split can be done if using unified KV cache
-                //       for simplicity, we always use sequential equal split for now
-                ubatch = balloc.split_equal(n_ubatch, true);
+                // Use non-sequential split when unified KV cache is enabled,
+                // supporting coupled sequences for tree speculation.
+                ubatch = balloc.split_equal(n_ubatch, /*sequential=*/ !is_unified);
             }
 
             if (ubatch.n_tokens == 0) {

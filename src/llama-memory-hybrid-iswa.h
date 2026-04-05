@@ -85,6 +85,10 @@ public:
 private:
     const llama_hparams & hparams;
 
+    // Whether the attention KV cache uses unified mode — enables non-sequential
+    // split_equal for tree speculation.
+    const bool is_unified;
+
     const std::unique_ptr<llama_kv_cache_iswa> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
 };

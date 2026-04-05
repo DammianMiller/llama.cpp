@@ -60,6 +60,15 @@ int main(int argc, char ** argv) {
     // probability threshold for splitting a draft branch (only for n_seq_dft > 1)
     const float p_draft_split = params.speculative.p_split;
 
+    // Tree speculation uses coupled sequences (multiple seq_ids per token) in
+    // the target batch. This requires a unified KV cache so split_equal can
+    // handle the batch without error "sequential split is not supported".
+    if (n_seq_dft > 1) {
+        params.kv_unified = true;
+        LOG_INF("%s: forcing kv_unified=true for tree speculation (n_seq_dft=%d)\n",
+            __func__, n_seq_dft);
+    }
+
     std::default_random_engine rng(params.sampling.seed == LLAMA_DEFAULT_SEED ? std::random_device()() : params.sampling.seed);
     std::uniform_real_distribution<> u_dist;
 
