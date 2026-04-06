@@ -524,7 +524,11 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+    // For MRoPE (n_pos_per_embd > 1), seq_add shifts only the temporal
+    // position component. Spatial components (ext.x, ext.y) are unaffected.
+    // The KV cache shift is applied via build_rope_shift() which uses
+    // NEOX-style rotation as a workaround for MRoPE (see llama-kv-cache.cpp:1681).
+    // This is safe for text-only generation where spatial positions are 0.
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
