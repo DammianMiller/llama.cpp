@@ -1176,11 +1176,9 @@ private:
 
             backend_sampling &= task.params.sampling.backend_sampling;
 
-            // TODO: backend sampling currently produces one token per sequence (t_sampled
-            // is map<seq_id, tensor>), but speculative verification needs D+1 tokens for
-            // the same sequence. Requires extending llama-graph.cpp to build sampler nodes
-            // per output position, not just per sequence.
-            backend_sampling &= !(slot.spec && task.params.speculative.n_max > 0);
+            // Backend sampling now supports multi-position: t_sampled is indexed by
+            // output row (not seq_id), so spec verification can read GPU-sampled tokens
+            // at each draft position via llama_get_sampled_token_ith().
 
             // TODO: getting post/pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_logits;
@@ -2919,15 +2917,42 @@ private:
 
                 const size_t n_draft = slot.drafted.size();
 
-                // Try GPU-accelerated verification first: if backend sampling ran during
-                // llama_decode(), tokens are already sampled at each batch position.
-                // Read them via llama_get_sampled_token_ith() — zero CPU sampling overhead.
-                // TODO: GPU multi-position sampling for speculative verification
-                // Currently, backend_sampling produces one token per sequence (t_sampled
-                // is map<seq_id, tensor>). Spec verification needs D+1 tokens for the
-                // same sequence. Requires extending llama-graph.cpp to build sampler
-                // nodes per output position, not per sequence.
-                const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+                // GPU-accelerated spec verification: read pre-sampled tokens from
+                // backend sampling (one per output position in the batch).
+                std::vector<llama_token> ids;
+                {
+                    bool gpu_ok = true;
+                    std::vector<llama_token> gpu_tokens;
+                    gpu_tokens.reserve(slot.i_batch_dft.size());
+
+                    for (size_t di = 0; di < slot.i_batch_dft.size(); ++di) {
+                        const llama_token tok = llama_get_sampled_token_ith(ctx, slot.i_batch_dft[di]);
+                        if (tok == LLAMA_TOKEN_NULL) {
+                            gpu_ok = false;
+                            break;
+                        }
+                        gpu_tokens.push_back(tok);
+                    }
+
+                    if (gpu_ok && gpu_tokens.size() == n_draft + 1) {
+                        // Accept/reject using GPU-sampled tokens (zero CPU sampling)
+                        for (size_t di = 0; di < n_draft; ++di) {
+                            common_sampler_accept(slot.smpl.get(), gpu_tokens[di], true);
+                            ids.push_back(gpu_tokens[di]);
+                            if (gpu_tokens[di] != slot.drafted[di]) {
+                                break;  // first mismatch
+                            }
+                        }
+                        // If all drafts matched, add the target-sampled token
+                        if (ids.size() == n_draft) {
+                            common_sampler_accept(slot.smpl.get(), gpu_tokens[n_draft], true);
+                            ids.push_back(gpu_tokens[n_draft]);
+                        }
+                    } else {
+                        // Fallback to CPU sampling
+                        ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+                    }
+                }
                 slot.i_batch_dft.clear();
                 slot.drafted.clear();
 

@@ -2659,14 +2659,22 @@ void llm_graph_context::build_sampling() const {
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
     res->add_input(std::move(inp_sampling));
 
-    std::map<llama_seq_id, int32_t> seq_to_logit_row;
-    int32_t logit_row_idx = 0;
-
-    for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-        if (ubatch.output[i]) {
-            llama_seq_id seq_id = ubatch.seq_id[i][0];
-            seq_to_logit_row[seq_id] = logit_row_idx;
-            logit_row_idx++;
+    // Build per-output-row sampler graph. Each output position (logits=true)
+    // gets its own sampler application, using the sampler for its sequence.
+    // This supports multi-position sampling for speculative decoding where
+    // the same sequence has D+1 output positions in one batch.
+    struct output_row_info {
+        uint32_t     row_idx;
+        llama_seq_id seq_id;
+    };
+    std::vector<output_row_info> output_rows;
+    {
+        uint32_t logit_row_idx = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+            if (ubatch.output[i]) {
+                output_rows.push_back({ logit_row_idx, ubatch.seq_id[i][0] });
+                logit_row_idx++;
+            }
         }
     }
 
@@ -2678,18 +2686,20 @@ void llm_graph_context::build_sampling() const {
     // this is important in order to minimize graph reallocations
     ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
 
-    for (const auto & [seq_id, sampler] : samplers) {
-        const auto it = seq_to_logit_row.find(seq_id);
+    for (const auto & row_info : output_rows) {
+        const auto sampler_it = samplers.find(row_info.seq_id);
+        if (sampler_it == samplers.end()) {
+            continue;
+        }
 
-        // inactive samplers always work on the first row
-        const auto row_idx = it != seq_to_logit_row.end() ? it->second : 0;
-        const int i_out    = it != seq_to_logit_row.end() ? 1          : 0;
+        llama_sampler * sampler = sampler_it->second;
+        const auto row_idx = row_info.row_idx;
 
-        ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row_idx * logits_t->nb[1]);
-        ggml_format_name(logits_seq, "logits_seq_%d", seq_id);
+        ggml_tensor * logits_row = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row_idx * logits_t->nb[1]);
+        ggml_format_name(logits_row, "logits_row_%u", row_idx);
 
         struct llama_sampler_data data = {
-            /*.logits      =*/ logits_seq,
+            /*.logits      =*/ logits_row,
             /*.probs       =*/ nullptr,
             /*.sampled     =*/ nullptr,
             /*.candidates  =*/ nullptr,
@@ -2699,27 +2709,42 @@ void llm_graph_context::build_sampling() const {
         sampler->iface->backend_apply(sampler, ctx0, gf, &data);
 
         if (data.sampled != nullptr) {
-            res->t_sampled[seq_id] = data.sampled;
+            res->t_sampled[row_idx] = data.sampled;
             outs[1] = data.sampled;
-            ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+            ggml_build_forward_select(gf, outs.data(), outs.size(), 1);
         }
 
         if (data.probs != nullptr) {
-            res->t_sampled_probs[seq_id] = data.probs;
+            res->t_sampled_probs[row_idx] = data.probs;
             outs[1] = data.probs;
-            ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+            ggml_build_forward_select(gf, outs.data(), outs.size(), 1);
         }
 
         if (data.logits != nullptr) {
-            res->t_sampled_logits[seq_id] = data.logits;
+            res->t_sampled_logits[row_idx] = data.logits;
             outs[1] = data.logits;
-            ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+            ggml_build_forward_select(gf, outs.data(), outs.size(), 1);
         }
 
         if (data.candidates != nullptr) {
-            res->t_candidates[seq_id] = data.candidates;
+            res->t_candidates[row_idx] = data.candidates;
             outs[1] = data.candidates;
-            ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+            ggml_build_forward_select(gf, outs.data(), outs.size(), 1);
+        }
+    }
+
+    // Ensure inactive samplers (not in any output row) have a graph node
+    for (const auto & [seq_id, sampler] : samplers) {
+        bool found = false;
+        for (const auto & row_info : output_rows) {
+            if (row_info.seq_id == seq_id) { found = true; break; }
+        }
+        if (!found) {
+            ggml_tensor * logits_dummy = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], 0);
+            ggml_format_name(logits_dummy, "logits_inactive_%d", seq_id);
+            struct llama_sampler_data data = { logits_dummy, nullptr, nullptr, nullptr };
+            sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            if (data.sampled) { ggml_build_forward_select(gf, outs.data(), outs.size(), 0); }
         }
     }
 

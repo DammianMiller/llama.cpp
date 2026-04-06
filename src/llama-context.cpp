@@ -1433,22 +1433,19 @@ static std::map<llama_seq_id, uint32_t> build_seq_to_output_row(const llama_ubat
 }
 
 static void copy_tensor_async_ints(
-    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
+    const std::map<uint32_t, ggml_tensor*> & tensor_map,
     const buffer_view<llama_token> & sampled,
-    const std::map<llama_seq_id, uint32_t> & seq_to_row,
+    uint32_t row_offset,
     ggml_backend_sched_t sched) {
     if (!sampled.has_data()) {
         return;
     }
 
-    for (const auto & [seq_id, tensor] : tensor_map) {
-        auto it = seq_to_row.find(seq_id);
-        if (it == seq_to_row.end()) {
+    for (const auto & [local_row, tensor] : tensor_map) {
+        const uint32_t row = row_offset + local_row;
+        if (row >= sampled.size) {
             continue;
         }
-
-        const uint32_t row = it->second;
-        GGML_ASSERT(row < sampled.size);
 
         GGML_ASSERT(ggml_is_contiguous(tensor) && "sampled tokens tensor must be contiguous for async copy");
 
@@ -1458,24 +1455,21 @@ static void copy_tensor_async_ints(
 }
 
 static void copy_tensor_async_floats(
-    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
+    const std::map<uint32_t, ggml_tensor*> & tensor_map,
     const buffer_view<float> & dst,
     size_t stride,
     std::vector<uint32_t> & counts,
-    const std::map<llama_seq_id, uint32_t> & seq_to_row,
+    uint32_t row_offset,
     ggml_backend_sched_t sched) {
     if (!dst.has_data()) {
         return;
     }
 
-    for (const auto & [seq_id, tensor] : tensor_map) {
-        auto it = seq_to_row.find(seq_id);
-        if (it == seq_to_row.end()) {
+    for (const auto & [local_row, tensor] : tensor_map) {
+        const uint32_t row = row_offset + local_row;
+        if (row >= counts.size()) {
             continue;
         }
-
-        const uint32_t row = it->second;
-        GGML_ASSERT(row < counts.size());
 
         GGML_ASSERT(ggml_is_contiguous(tensor) && "logits/probs tensor must be contiguous for async copy");
 
@@ -1483,30 +1477,26 @@ static void copy_tensor_async_floats(
         float * row_ptr = dst.data + (size_t) row * stride;
         ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
 
-        // Update the actual number of logits/probabilities that were written for this row.
         counts[row] = ggml_nelements(tensor);
     }
 }
 
 static void copy_tensor_async_candidates(
-    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
+    const std::map<uint32_t, ggml_tensor*> & tensor_map,
     const buffer_view<llama_token> & dst,
     size_t stride,
     std::vector<uint32_t> & counts,
-    const std::map<llama_seq_id, uint32_t> & seq_to_row,
+    uint32_t row_offset,
     ggml_backend_sched_t sched) {
     if (!dst.has_data()) {
         return;
     }
 
-    for (const auto & [seq_id, tensor] : tensor_map) {
-        auto it = seq_to_row.find(seq_id);
-        if (it == seq_to_row.end()) {
+    for (const auto & [local_row, tensor] : tensor_map) {
+        const uint32_t row = row_offset + local_row;
+        if (row >= counts.size()) {
             continue;
         }
-
-        const uint32_t row = it->second;
-        GGML_ASSERT(row < counts.size());
 
         GGML_ASSERT(ggml_is_contiguous(tensor) && "candidates tensor must be contiguous for async copy");
 
@@ -1514,7 +1504,6 @@ static void copy_tensor_async_candidates(
         llama_token * row_ptr = dst.data + (size_t) row * stride;
         ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
 
-        // Update the actual number of candidates that were written.
         counts[row] = ggml_nelements(tensor);
     }
 }
@@ -1813,15 +1802,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
-            const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
+            // t_sampled and related maps are now indexed by output row (not seq_id).
+            // row_offset = n_outputs_prev maps local row indices to global output rows.
             const auto stride = n_vocab;
 
-            // async copy the sampling data from the backend to the host
-            copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched.get());
-
-            copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
-            copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
-            copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
+            copy_tensor_async_ints      (res->t_sampled,        sampling.sampled,                                                          n_outputs_prev, sched.get());
+            copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,                         n_outputs_prev, sched.get());
+            copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,                          n_outputs_prev, sched.get());
+            copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count,                     n_outputs_prev, sched.get());
         }
 
         n_outputs_prev += n_outputs;

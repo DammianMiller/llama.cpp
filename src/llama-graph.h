@@ -662,10 +662,13 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
 
-    std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
-    std::map<llama_seq_id, ggml_tensor*> t_candidates;
-    std::map<llama_seq_id, ggml_tensor*> t_sampled;
-    std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
+    // Backend sampling outputs, indexed by output row (not seq_id).
+    // This supports multi-position sampling: the same sequence can have
+    // multiple output rows (e.g., speculative decoding verification batch).
+    std::map<uint32_t, ggml_tensor*> t_sampled_logits;
+    std::map<uint32_t, ggml_tensor*> t_candidates;
+    std::map<uint32_t, ggml_tensor*> t_sampled;
+    std::map<uint32_t, ggml_tensor*> t_sampled_probs;
 
     std::vector<llm_graph_input_ptr> inputs;
 
