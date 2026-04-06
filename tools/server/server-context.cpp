@@ -1176,7 +1176,10 @@ private:
 
             backend_sampling &= task.params.sampling.backend_sampling;
 
-            // TODO: speculative decoding requires multiple samples per batch - not supported yet
+            // TODO: backend sampling currently produces one token per sequence (t_sampled
+            // is map<seq_id, tensor>), but speculative verification needs D+1 tokens for
+            // the same sequence. Requires extending llama-graph.cpp to build sampler nodes
+            // per output position, not just per sequence.
             backend_sampling &= !(slot.spec && task.params.speculative.n_max > 0);
 
             // TODO: getting post/pre sampling logits is not yet supported with backend sampling
@@ -2916,7 +2919,14 @@ private:
 
                 const size_t n_draft = slot.drafted.size();
 
-                // the accepted tokens from the speculation
+                // Try GPU-accelerated verification first: if backend sampling ran during
+                // llama_decode(), tokens are already sampled at each batch position.
+                // Read them via llama_get_sampled_token_ith() — zero CPU sampling overhead.
+                // TODO: GPU multi-position sampling for speculative verification
+                // Currently, backend_sampling produces one token per sequence (t_sampled
+                // is map<seq_id, tensor>). Spec verification needs D+1 tokens for the
+                // same sequence. Requires extending llama-graph.cpp to build sampler
+                // nodes per output position, not per sequence.
                 const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
                 slot.i_batch_dft.clear();
                 slot.drafted.clear();
