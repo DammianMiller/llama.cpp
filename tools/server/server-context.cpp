@@ -2303,8 +2303,8 @@ private:
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
-                            // note: when n_swa == 0, the model does not use SWA, which is equivalent to a window of 1
-                            const auto n_swa = std::max(1, llama_model_n_swa(model));
+                            // note: when n_swa == 0, the model does not use SWA
+                            const auto n_swa = std::max(0, llama_model_n_swa(model));
 
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa);
@@ -2603,7 +2603,7 @@ private:
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id);
 
                     // no need for empty or small checkpoints
-                    do_checkpoint = do_checkpoint && (pos_min >= 0 && pos_max >= 64);
+                    do_checkpoint = do_checkpoint && (pos_min >= 0 && slot.prompt.n_tokens() >= 64);
 
                     // no need to create checkpoints that are too close together
                     do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || pos_max > slot.prompt.checkpoints.back().pos_max + 64);
