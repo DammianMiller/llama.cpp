@@ -33,7 +33,6 @@ llama_memory_hybrid::llama_memory_hybrid(
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr) :
     hparams(model.hparams),
-    is_unified(unified),
     mem_attn(new llama_kv_cache(
         model,
         type_k,
@@ -77,11 +76,9 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
-                // Use non-sequential split when unified KV cache is enabled —
-                // this supports coupled sequences (multiple seq_ids per token)
-                // required for tree speculation. Otherwise stick with sequential
-                // split for simplicity.
-                ubatch = balloc.split_equal(n_ubatch, /*sequential=*/ !is_unified);
+                // TODO: non-sequential equal split can be done if using unified KV cache
+                //       for simplicity, we always use sequential equal split for now
+                ubatch = balloc.split_equal(n_ubatch, true);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -96,34 +93,35 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             break;
         }
 
-        // Save recurrent checkpoint BEFORE processing speculative batches.
-        // This is CPU-side (tensor data copied GPU->CPU via ggml_backend_tensor_get)
-        // so no GPU memory impact. Required because SSM state cannot be rolled back
-        // positionally — we must snapshot the state before mutation.
-        //
-        // Only checkpoint for short multi-token batches (likely speculative) to
-        // avoid overhead during prompt prefill.
-        {
-            std::unordered_set<llama_seq_id> seqs_to_checkpoint;
-            constexpr uint32_t max_spec_checkpoint_tokens = 64;
+        // Save recurrent checkpoints before short multi-token speculative batches.
+        // Avoid checkpointing long prompt-prefill batches because CPU<->GPU copies
+        // of recurrent state are expensive and unnecessary there.
+        bool has_speculative_batch = false;
+        std::unordered_set<llama_seq_id> seqs_to_checkpoint;
+        constexpr uint32_t max_spec_checkpoint_tokens = 64;
 
-            for (const auto & ub : ubatches) {
-                if (ub.n_tokens <= 1 || ub.n_tokens > max_spec_checkpoint_tokens) {
-                    continue;
-                }
-                if (ub.seq_id == nullptr || ub.n_seq_id == nullptr) {
-                    continue;
-                }
-                for (uint32_t s = 0; s < ub.n_seqs; ++s) {
-                    const uint32_t i = s*ub.n_seq_tokens;
-                    if (ub.n_seq_id[i] == 0) {
-                        continue;
-                    }
-                    const llama_seq_id seq_id = ub.seq_id[i][0];
-                    seqs_to_checkpoint.insert(seq_id);
-                }
+        for (const auto & ub : ubatches) {
+            if (ub.n_tokens <= 1 || ub.n_tokens > max_spec_checkpoint_tokens) {
+                continue;
             }
 
+            has_speculative_batch = true;
+
+            if (ub.seq_id == nullptr || ub.n_seq_id == nullptr) {
+                continue;
+            }
+
+            for (uint32_t s = 0; s < ub.n_seqs; ++s) {
+                const uint32_t i = s*ub.n_seq_tokens;
+                if (ub.n_seq_id[i] == 0) {
+                    continue;
+                }
+                const llama_seq_id seq_id = ub.seq_id[i][0];
+                seqs_to_checkpoint.insert(seq_id);
+            }
+        }
+
+        if (has_speculative_batch) {
             for (const auto seq_id : seqs_to_checkpoint) {
                 save_recurrent_checkpoint(seq_id);
             }
@@ -299,6 +297,11 @@ bool llama_memory_hybrid::restore_recurrent_checkpoint(llama_seq_id seq_id) {
     return true;
 }
 
+bool llama_memory_hybrid::has_recurrent_checkpoint(llama_seq_id seq_id) const {
+    const auto it = cpu_checkpoints.find(seq_id);
+    return it != cpu_checkpoints.end() && it->second.valid;
+}
+
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
@@ -311,23 +314,14 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return false;
         }
 
-        // Look up checkpoint saved upfront in init_batch() BEFORE batch mutation.
-        // Accept any checkpoint at position <= p0-1. The server's activation replay
-        // will re-decode tokens from checkpoint position forward to reach p0-1.
         auto it = cpu_checkpoints.find(seq_id);
-
-        if (it != cpu_checkpoints.end() && it->second.valid && it->second.pos <= p0 - 1) {
+        if (it != cpu_checkpoints.end() && it->second.valid && it->second.pos == p0 - 1) {
             if (!restore_recurrent_checkpoint(seq_id)) {
                 return false;
             }
-            // Trim attention KV to match checkpoint position. Server's activation
-            // replay re-decodes tokens from (ckpt.pos + 1) to (p0 - 1) to sync
-            // both caches back to the target rollback position.
-            const llama_pos attn_trim_from = it->second.pos + 1;
-            return mem_attn->seq_rm(seq_id, attn_trim_from, p1);
         } else {
             // Fallback: keep recurrent positions aligned with attention cache even if
-            // we don't have a usable checkpoint.
+            // we don't have an exact checkpoint for p0 - 1.
             bool aligned = false;
             for (auto & cell : mem_recr->cells) {
                 if (cell.has_seq_id(seq_id) && cell.pos >= p0) {
@@ -468,14 +462,6 @@ const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
 
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
     return static_cast<const llama_kv_cache_context *>(ctx_attn.get());
-}
-
-ggml_tensor * llama_memory_hybrid_context::get_turbo_rot_forward() const {
-    return ctx_attn ? ctx_attn->get_turbo_rot_forward() : nullptr;
-}
-
-ggml_tensor * llama_memory_hybrid_context::get_turbo_rot_inverse() const {
-    return ctx_attn ? ctx_attn->get_turbo_rot_inverse() : nullptr;
 }
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {

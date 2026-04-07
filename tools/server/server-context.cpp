@@ -3135,6 +3135,9 @@ struct server_res_generator : server_http_res {
     }
 };
 
+void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
+    impl->queue_tasks.on_sleeping_state(std::move(callback));
+}
 
 
 //

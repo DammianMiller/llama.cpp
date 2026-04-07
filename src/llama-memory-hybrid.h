@@ -86,11 +86,6 @@ public:
 private:
     const llama_hparams & hparams;
 
-    // Whether the attention KV cache uses unified mode (shared across sequences).
-    // When true, split_equal can use non-sequential mode which supports coupled
-    // sequences (multiple seq_ids per token) needed for tree speculation.
-    const bool is_unified;
-
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
 
@@ -109,6 +104,7 @@ private:
     // Save/restore recurrent state to/from CPU RAM
     void save_recurrent_checkpoint(llama_seq_id seq_id);
     bool restore_recurrent_checkpoint(llama_seq_id seq_id);
+    bool has_recurrent_checkpoint(llama_seq_id seq_id) const;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {
@@ -140,10 +136,6 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
-
-    // TurboQuant: delegate to the KV cache context
-    ggml_tensor * get_turbo_rot_forward() const override;
-    ggml_tensor * get_turbo_rot_inverse() const override;
 
     //
     // llama_memory_hybrid_context
