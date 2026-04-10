@@ -314,14 +314,20 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return false;
         }
 
+        // Accept checkpoint at pos <= p0-1 (not just == p0-1). When checkpoint
+        // is further back than target, restore it and trim attention KV to match.
+        // Server's activation replay re-decodes tokens from (ckpt.pos + 1) to
+        // (p0 - 1) to bring both caches in sync.
         auto it = cpu_checkpoints.find(seq_id);
-        if (it != cpu_checkpoints.end() && it->second.valid && it->second.pos == p0 - 1) {
+        if (it != cpu_checkpoints.end() && it->second.valid && it->second.pos <= p0 - 1) {
             if (!restore_recurrent_checkpoint(seq_id)) {
                 return false;
             }
+            const llama_pos attn_trim_from = it->second.pos + 1;
+            return mem_attn->seq_rm(seq_id, attn_trim_from, p1);
         } else {
             // Fallback: keep recurrent positions aligned with attention cache even if
-            // we don't have an exact checkpoint for p0 - 1.
+            // we don't have a usable checkpoint.
             bool aligned = false;
             for (auto & cell : mem_recr->cells) {
                 if (cell.has_seq_id(seq_id) && cell.pos >= p0) {
