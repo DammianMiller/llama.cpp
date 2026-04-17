@@ -332,6 +332,14 @@ struct common_params_speculative {
     // from older K=2 user-side dumps). Empty = no preload.
     std::string ngram_mod_preload;
 
+    // persist ngram_mod state across restarts (cherry-pick from turbo b0e905ac1).
+    // Empty = disabled.
+    std::string ngram_mod_persist_path;
+
+    // reset ngram_mod cache after N consecutive low-acceptance (<0.5) requests.
+    // 0 = disable auto-reset; default 3 (original hardcoded behaviour).
+    int ngram_mod_reset_streak = 3;
+
     // DDTree (Phase 5/6) — tree-structured speculative verify over an
     // ngram-mod drafter. When ddtree_enable is true and the target is a
     // hybrid delta-net model, the server-side spec loop should build a

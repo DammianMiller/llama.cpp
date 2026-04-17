@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <string>
 #include <cstddef>
 #include <string>
 
@@ -50,7 +51,11 @@ struct common_ngram_mod {
     size_t size()       const;
     size_t size_bytes() const;
 
-    // NGMD v2 format round-trip. returns false on I/O or validation failure.
+    // NGMD v2 format round-trip — save/load raw entries + metadata to disk.
+    // Returns false on I/O or validation failure. File format:
+    // magic "NGMD" + u32 version + u32 n + u64 size + u32 K + raw entries.
+    // Used by both --spec-ngram-mod-preload (load at startup) and
+    // --spec-ngram-persist (save on shutdown; turbo b0e905ac1).
     bool save(const std::string & path) const;
     bool load(const std::string & path);
 
