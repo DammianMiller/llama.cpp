@@ -2515,11 +2515,20 @@ ggml_tensor * llm_graph_context::build_rs(
     ggml_build_forward_expand(gf, output_states);
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)
-    ggml_tensor * states_extra = ggml_get_rows(ctx0, states, state_copy_extra);
-    ggml_build_forward_expand(gf,
-        ggml_cpy(ctx0,
-            states_extra,
-            ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+    //
+    // Skip the defragmentation ops entirely when there are no extra cells to move.
+    // This matters on hybrid SSM+attention models with n_seq_max > 1: without this
+    // guard, every recurrent layer emits a per-decode ggml_get_rows + ggml_cpy even
+    // when `n_rs == n_seqs` and the extra view is already empty. Those ops are
+    // technically zero-element no-ops but still traverse the backend scheduler for
+    // every layer × decode, which on CUDA adds ~200-400 µs per step at 40 layers.
+    if ((int32_t)n_rs > n_seqs) {
+        ggml_tensor * states_extra = ggml_get_rows(ctx0, states, state_copy_extra);
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0,
+                states_extra,
+                ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+    }
 
     return output_states;
 }
