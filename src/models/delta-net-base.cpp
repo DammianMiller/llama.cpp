@@ -403,16 +403,21 @@ void llm_build_delta_net_base::build_persist_conv_input(ggml_cgraph * gf, int il
     // conv_input shape:        [(d_conv-1) + n_tokens, conv_channels, n_seqs]
     // conv_input_cache shape:  [(d_conv-1) + max_verify_tokens, conv_channels]  (n_seqs=1 assumed)
     //
-    // We copy the live conv_input (which may be shorter along dim 0 than the
-    // cache if n_tokens < max_verify_tokens) into the leading rows of a
-    // matching 2D view of the cache. Columns along conv_channels are
-    // contiguous in both tensors; the cache's dim-0 stride is its full
-    // window including the headroom for max_verify_tokens.
+    // The cache is sized for verify-sized batches only. Skip persistence on
+    // prompt-prefill batches (live_window > cache capacity) and on any
+    // batch with n_seqs > 1 — those can't be meaningfully rolled back via
+    // the persist path anyway. The chain-mode rollback fallback covers them.
     const int64_t live_window   = conv_input->ne[0];
     const int64_t conv_channels = conv_input->ne[1];
-    GGML_ASSERT(conv_input->ne[2] == 1 && "verify-cache conv persist assumes n_seqs == 1");
-    GGML_ASSERT(conv_cache->ne[1] == conv_channels);
-    GGML_ASSERT(conv_cache->ne[0] >= live_window);
+    if (conv_input->ne[2] != 1) {
+        return; // multi-seq decode — persist path is single-seq only for now
+    }
+    if (conv_cache->ne[1] != conv_channels) {
+        return; // defensive: conv_channels mismatch (wrong layer dims)
+    }
+    if (conv_cache->ne[0] < live_window) {
+        return; // live batch too large for persist buffer (prompt-prefill case)
+    }
 
     // Slim view of the cache covering only the live window so the ggml_cpy
     // destination shape matches the source.
@@ -457,11 +462,24 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
     // Attach the hybrid memory's verify-cache persist tensor for this layer, if
-    // enabled. When the feature is off (the default) this stays nullptr and
-    // build_gated_delta_net falls back to the exact chain-mode ggml path.
+    // enabled and the live batch is small enough to fit into its
+    // max_verify_tokens dim. When the feature is off (the default) or this
+    // is a prompt-prefill batch larger than the verify budget, persist_inter
+    // stays nullptr and build_gated_delta_net falls back to the exact
+    // chain-mode ggml path.
     ggml_tensor * persist_inter = nullptr;
     if (const auto * hctx = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
-        persist_inter = hctx->get_ssm_intermediate(il);
+        ggml_tensor * cand = hctx->get_ssm_intermediate(il);
+        if (cand != nullptr) {
+            // ssm_intermediate shape: [S_v*S_v, H, max_verify_tokens, n_seqs].
+            // Skip persist when the live batch exceeds max_verify_tokens
+            // (prompt prefill) or spans >1 seq (the persist path is
+            // single-seq only for now).
+            const int64_t max_verify_tokens = cand->ne[2];
+            if (n_tokens <= max_verify_tokens && n_seqs == 1) {
+                persist_inter = cand;
+            }
+        }
     } else if (const auto * hictx = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
         // iswa hybrid is used by non-delta-net models today; guard anyway.
         (void) hictx;

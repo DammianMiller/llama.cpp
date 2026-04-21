@@ -2151,7 +2151,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params p{
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -2168,6 +2168,18 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+
+    // Plumb any pending DDTree verify descriptor — consumed one-shot.
+    if (tree_verify.pending && tree_verify.n_tokens > 0) {
+        p.tree_verify_pending = true;
+        p.tree_n_tokens       = tree_verify.n_tokens;
+        p.tree_mask_kv_pad    = tree_verify.mask_kv_pad;
+        p.tree_mask_q_pad     = tree_verify.mask_q_pad;
+        p.tree_parent_ids     = tree_verify.parent_ids.data();
+        p.tree_mask_f16       = tree_verify.mask_f16.data();
+    }
+
+    return p;
 }
 
 ggml_status llama_context::graph_compute(
