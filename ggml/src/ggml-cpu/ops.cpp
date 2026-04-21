@@ -9302,13 +9302,95 @@ static void ggml_compute_forward_ssm_conv_f32(
     }
 }
 
+// Tree-mode variant of ggml_compute_forward_ssm_conv_f32.
+//
+// Reads the optional src[2] = parent_ids (i32, [n_t, n_s]) and, for each new
+// token t, walks the parent chain (d_conv - 1) times to gather the conv window
+// instead of using the DFS-adjacent slots. Virtual-slot encoding matches the
+// CUDA kernel (ssm_conv_tree_f32 in ggml-cuda/ssm-conv.cu):
+//   ancestors[nc-1] = t
+//   ancestors[k]    = prev >= 0 ? parent_ids[prev] : prev - 1   (for k < nc-1)
+// and sx_slot = (nc - 1) + ancestors[k] into src0's dim-0 axis, so negative
+// ancestor indices walk into the pre-block conv-state region [0, nc - 1).
+static void ggml_compute_forward_ssm_conv_tree_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0       = dst->src[0]; // conv_x       [ncs, d_inner, n_s]
+    const ggml_tensor * src1       = dst->src[1]; // conv1d.weight [nc, d_inner]
+    const ggml_tensor * src_parent = dst->src[2]; // parent_ids   [n_t, n_s] i32
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc  = src1->ne[0]; // d_conv
+    const int ncs = src0->ne[0]; // d_conv - 1 + n_t
+    const int nr  = src0->ne[1]; // d_inner
+    const int n_t =  dst->ne[1];
+    const int n_s =  dst->ne[2];
+
+    GGML_ASSERT( dst->ne[0] == nr);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT(src0->nb[1] == src0->ne[0]*sizeof(float));
+    GGML_ASSERT(src_parent->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(src_parent));
+    GGML_ASSERT(ggml_nelements(src_parent) == (int64_t)n_t * n_s);
+
+    // Stack-allocated scratch for the per-token ancestor chain. d_conv for
+    // every hybrid model shipped through llama.cpp as of 2026 is <= 9.
+    enum { TREE_ANCESTORS_MAX = 16 };
+    GGML_ASSERT(nc <= TREE_ANCESTORS_MAX);
+
+    const int dr  = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+    const int ir  = ir1 - ir0;
+
+    const int32_t * parent_ids = (const int32_t *) src_parent->data;
+
+    for (int i3 = 0; i3 < n_s; ++i3) {
+        const int32_t * parent_ids_seq = parent_ids + (int64_t) i3 * n_t;
+        for (int i2 = 0; i2 < n_t; ++i2) {
+            int ancestors[TREE_ANCESTORS_MAX];
+            ancestors[nc - 1] = i2;
+            for (int k = nc - 2; k >= 0; k--) {
+                const int prev = ancestors[k + 1];
+                ancestors[k] = (prev >= 0) ? parent_ids_seq[prev] : (prev - 1);
+            }
+
+            const float * c = (const float *) ((const char *) src1->data + ir0*(src1->nb[1]));
+            float       * x = (float *)       ((char *)       dst->data  + ir0*(dst->nb[0])
+                                                                         + i2*(dst->nb[1])
+                                                                         + i3*(dst->nb[2]));
+
+            for (int i1 = 0; i1 < ir; ++i1) {
+                const float * s = (const float *) ((const char *) src0->data
+                                                   + (ir0 + i1)*(src0->nb[1])
+                                                   + i3*(src0->nb[2]));
+
+                float sumf = 0.0f;
+                for (int k = 0; k < nc; ++k) {
+                    const int sx_slot = (nc - 1) + ancestors[k];
+                    GGML_ASSERT(sx_slot >= 0 && sx_slot < ncs);
+                    sumf += s[sx_slot] * c[k + i1*nc];
+                }
+                x[i1] = sumf;
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_ssm_conv(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     switch (dst->src[0]->type) {
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_ssm_conv_f32(params, dst);
+                if (dst->src[2] != NULL) {
+                    ggml_compute_forward_ssm_conv_tree_f32(params, dst);
+                } else {
+                    ggml_compute_forward_ssm_conv_f32(params, dst);
+                }
             } break;
         default:
             {
@@ -10433,12 +10515,17 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     int64_t ir0,
     int64_t ir1) {
 
-    ggml_tensor * src_q     = dst->src[0];
-    ggml_tensor * src_k     = dst->src[1];
-    ggml_tensor * src_v     = dst->src[2];
-    ggml_tensor * src_g     = dst->src[3];
-    ggml_tensor * src_beta  = dst->src[4];
-    ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_q       = dst->src[0];
+    ggml_tensor * src_k       = dst->src[1];
+    ggml_tensor * src_v       = dst->src[2];
+    ggml_tensor * src_g       = dst->src[3];
+    ggml_tensor * src_beta    = dst->src[4];
+    ggml_tensor * src_state   = dst->src[5];
+    // Optional dflash extensions: src[6] = parent_ids (i32) for tree-mode
+    // branch reload; src[7] = persist_inter (f32 or f16) for external
+    // per-token intermediate-state writeback. See ggml.h::ggml_gated_delta_net_ex.
+    const ggml_tensor * src_parent  = dst->src[6];
+    const ggml_tensor * src_persist = dst->src[7];
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
@@ -10454,6 +10541,19 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     GGML_ASSERT(src_g->ne[0] == 1 || src_g->ne[0] == S_v);
     GGML_ASSERT(src_beta->ne[0] == 1);
+
+    if (src_parent) {
+        GGML_ASSERT(src_parent->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(src_parent));
+        GGML_ASSERT(ggml_nelements(src_parent) == n_tokens * n_seqs);
+        GGML_ASSERT(src_persist != NULL); // tree mode requires persist buffer
+    }
+    if (src_persist) {
+        GGML_ASSERT(src_persist->type == GGML_TYPE_F32 ||
+                    src_persist->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(src_persist));
+        GGML_ASSERT(ggml_nelements(src_persist) >= S_v * S_v * H * n_tokens * n_seqs);
+    }
 
     GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
     GGML_TENSOR_LOCALS(size_t,  nbq, src_q, nb);
@@ -10482,6 +10582,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float * state_in_base = (const float *)src_state->data;
 
+    const int32_t *     parent_ids_base = src_parent  ? (const int32_t *) src_parent->data : NULL;
+    void * const        persist_data    = src_persist ? src_persist->data : NULL;
+    const bool          persist_is_f16  = src_persist && src_persist->type == GGML_TYPE_F16;
+    const int64_t       slot_elems      = S_v * S_v;
+
   //const int64_t rq1 = nev1 / neq1;
   //const int64_t rk1 = nev1 / nek1;
     const int64_t rq3 = nev3 / neq3;
@@ -10499,16 +10604,44 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
 
-        float * s_out = state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        float * s_out = state_out_base + (iv3 * H + iv1) * slot_elems;
 
         // copy input state into output buffer and operate in-place
-        const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        const float * s_in = state_in_base + (iv3 * H + iv1) * slot_elems;
+        memcpy(s_out, s_in, slot_elems * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
 
+        const int32_t * parent_ids_seq = parent_ids_base
+            ? parent_ids_base + iv3 * n_tokens
+            : NULL;
+
         for (int64_t t = 0; t < n_tokens; t++) {
+            // Tree-mode branch reload: at branch points (parent is neither
+            // "previous token" nor the pre-block state reset sentinel), pull
+            // state from the persist buffer at parent's slot. Mirrors the
+            // CUDA kernel's TREE_MODE block.
+            if (parent_ids_seq != NULL && t > 0) {
+                const int32_t parent_t = parent_ids_seq[t];
+                if (parent_t < 0) {
+                    // root-level sibling: reset to pre-block state
+                    memcpy(s_out, s_in, slot_elems * sizeof(float));
+                } else if (parent_t != t - 1) {
+                    const int64_t slot = (iv3 * n_tokens + parent_t) * H + iv1;
+                    if (persist_is_f16) {
+                        const ggml_fp16_t * p = (const ggml_fp16_t *) persist_data + slot * slot_elems;
+                        for (int64_t i = 0; i < slot_elems; ++i) {
+                            s_out[i] = GGML_CPU_FP16_TO_FP32(p[i]);
+                        }
+                    } else {
+                        const float * p = (const float *) persist_data + slot * slot_elems;
+                        memcpy(s_out, p, slot_elems * sizeof(float));
+                    }
+                }
+                // parent_t == t - 1: sequential, keep s_out as-is.
+            }
+
             const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
             const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
@@ -10549,6 +10682,22 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 float sum = 0.0f;
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
                 attn_data[j] = sum * scale;
+            }
+
+            // Persist the post-token state to the external buffer if provided.
+            // Matches the transposed layout used by s_out (and the CUDA
+            // store_inter_state ordering), with f32 and f16 storage variants.
+            if (persist_data != NULL) {
+                const int64_t slot = (iv3 * n_tokens + t) * H + iv1;
+                if (persist_is_f16) {
+                    ggml_fp16_t * p = (ggml_fp16_t *) persist_data + slot * slot_elems;
+                    for (int64_t i = 0; i < slot_elems; ++i) {
+                        p[i] = GGML_CPU_FP32_TO_FP16(s_out[i]);
+                    }
+                } else {
+                    float * p = (float *) persist_data + slot * slot_elems;
+                    memcpy(p, s_out, slot_elems * sizeof(float));
+                }
             }
 
             attn_data += S_v * H; // advance to next token
