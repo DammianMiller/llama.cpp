@@ -3545,6 +3545,86 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+// GGML_OP_SSM_CONV with tree-mode parent_ids (dflash extension)
+// Exercises ggml_ssm_conv_tree: src[2] = parent_ids [n_t, n_s] i32.
+// pattern selects how parent_ids is populated:
+//   CHAIN: [-1, 0, 1, ..., n_t-2]  — tree collapses to a chain, output must
+//          match ggml_ssm_conv bit-for-bit on a sane backend.
+//   ROOTS: [-1, -1, ..., -1]       — every token reads only from pre-state.
+//   BRANCH: first half -1, second half parents = first half idx — classic
+//          two-branch tree that stresses the parent-chain walk.
+struct test_ssm_conv_tree : public test_case {
+    enum tree_pattern { CHAIN, ROOTS, BRANCH };
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_a;
+    const std::array<int64_t, 4> ne_b;
+    const tree_pattern pattern;
+
+    std::string pattern_name() const {
+        switch (pattern) {
+            case CHAIN:  return "CHAIN";
+            case ROOTS:  return "ROOTS";
+            case BRANCH: return "BRANCH";
+        }
+        return "?";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne_a, ne_b) + ",pattern=" + pattern_name();
+    }
+
+    test_ssm_conv_tree(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne_a = {10, 10, 10, 1},
+            std::array<int64_t, 4> ne_b = {3, 3, 1, 1},
+            tree_pattern pattern = CHAIN)
+        : type(type), ne_a(ne_a), ne_b(ne_b), pattern(pattern) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_b.data());
+
+        const int64_t n_t = ne_a[0] - ne_b[0] + 1;
+        const int64_t n_s = ne_a[2];
+        ggml_tensor * parent_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_t, n_s);
+        ggml_set_name(parent_ids, "parent_ids");
+
+        ggml_tensor * out = ggml_ssm_conv_tree(ctx, a, b, parent_ids);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                const int64_t n_t = t->ne[0];
+                const int64_t n_s = t->ne[1];
+                std::vector<int32_t> data(n_t * n_s);
+                for (int64_t s = 0; s < n_s; s++) {
+                    for (int64_t i = 0; i < n_t; i++) {
+                        int32_t p = -1;
+                        switch (pattern) {
+                            case CHAIN:  p = (int32_t)(i - 1); break;
+                            case ROOTS:  p = -1; break;
+                            case BRANCH: {
+                                const int64_t half = n_t / 2;
+                                if (i < half) {
+                                    p = (int32_t)(i - 1); // first half is a chain rooted at pre-state
+                                } else {
+                                    p = (int32_t)(i - half - 1); // second half re-attaches to first half
+                                    if (p < 0) p = -1;
+                                }
+                            } break;
+                        }
+                        data[s * n_t + i] = p;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -3676,6 +3756,115 @@ struct test_gated_delta_net : public test_case {
         ggml_tensor * state = ggml_new_tensor_2d(ctx, type, head_size * v_repeat * head_size * head_count, n_seqs);
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
         return out;
+    }
+};
+
+// GGML_OP_GATED_DELTA_NET with dflash extensions:
+//   - tree_mode   : src[6] = parent_ids [n_seq_tokens, n_seqs] i32
+//   - has_persist : src[7] = persist_inter [S_v, S_v, H, n_seq_tokens, n_seqs]
+// tree_mode requires has_persist (asserted). Covers three regimes:
+//   CHAIN  : parents = [-1,0,1,2,...]  — equivalent to chain mode; dst output
+//            must match ggml_gated_delta_net bit-for-bit on consistent backends.
+//   BRANCH : parents = [-1,0,0,-1]     — exercises branch-reload and root-reset.
+//   CHAIN_PERSIST: persist only, no parent_ids — tests the write path.
+struct test_gated_delta_net_ex : public test_case {
+    enum ex_mode { CHAIN_PERSIST, TREE_CHAIN, TREE_BRANCH };
+    const ggml_type type;
+    const ggml_type persist_type; // F32 or F16
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const bool    kda;
+    const ex_mode mode;
+
+    std::string mode_name() const {
+        switch (mode) {
+            case CHAIN_PERSIST: return "CHAIN_PERSIST";
+            case TREE_CHAIN:    return "TREE_CHAIN";
+            case TREE_BRANCH:   return "TREE_BRANCH";
+        }
+        return "?";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, persist_type, head_count, head_size, n_seq_tokens, n_seqs, kda) + ",mode=" + mode_name();
+    }
+
+    test_gated_delta_net_ex(ggml_type type = GGML_TYPE_F32,
+            ggml_type persist_type = GGML_TYPE_F32,
+            int64_t head_count = 4, int64_t head_size = 16,
+            int64_t n_seq_tokens = 4, int64_t n_seqs = 1,
+            bool kda = false,
+            ex_mode mode = TREE_CHAIN)
+        : type(type), persist_type(persist_type),
+          head_count(head_count), head_size(head_size),
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          kda(kda), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
+
+        const int64_t g_ne0 = kda ? head_size : 1;
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, type, head_size * head_size * head_count, n_seqs);
+
+        ggml_tensor * parent_ids = nullptr;
+        if (mode == TREE_CHAIN || mode == TREE_BRANCH) {
+            parent_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_seq_tokens, n_seqs);
+            ggml_set_name(parent_ids, "parent_ids");
+        }
+
+        // Persist buffer is always required here (CHAIN_PERSIST) or implied by tree mode.
+        ggml_tensor * persist_inter = ggml_new_tensor_4d(
+            ctx, persist_type,
+            head_size * head_size,
+            head_count,
+            n_seq_tokens,
+            n_seqs);
+        ggml_set_name(persist_inter, "persist_inter");
+
+        ggml_tensor * out = ggml_gated_delta_net_ex(ctx, q, k, v, g, beta, state, parent_ids, persist_inter);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                // parent_ids
+                std::vector<int32_t> data(n_seq_tokens * n_seqs);
+                for (int64_t s = 0; s < n_seqs; s++) {
+                    for (int64_t i = 0; i < n_seq_tokens; i++) {
+                        int32_t p;
+                        if (mode == TREE_CHAIN) {
+                            p = (int32_t)(i - 1);
+                        } else {
+                            // TREE_BRANCH: first token root, second chains to first,
+                            // third branches back to first, fourth back to root.
+                            if (n_seq_tokens < 4) {
+                                p = (int32_t)(i - 1);
+                            } else {
+                                int32_t tpl[4] = { -1, 0, 0, -1 };
+                                p = tpl[i % 4];
+                            }
+                        }
+                        data[s * n_seq_tokens + i] = p;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == ggml_get_tensor(ctx, "persist_inter")) {
+                // zero-init: kernel writes this, initial contents irrelevant but
+                // compare between backends requires same starting bytes.
+                const size_t nb = ggml_nbytes(t);
+                std::vector<uint8_t> zero(nb, 0);
+                ggml_backend_tensor_set(t, zero.data(), 0, nb);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -8676,6 +8865,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
+
+    // dflash extensions — tree_mode (parent_ids) + persistent intermediate buffer.
+    // d_inner is constrained to multiples of 128 by the CUDA ssm_conv kernel.
+    // Keep n_t and n_s small so the CPU reference runs in seconds.
+    test_cases.emplace_back(new test_ssm_conv_tree(GGML_TYPE_F32, {10, 128, 2, 1}, {3, 128, 1, 1}, test_ssm_conv_tree::CHAIN));
+    test_cases.emplace_back(new test_ssm_conv_tree(GGML_TYPE_F32, {10, 128, 2, 1}, {3, 128, 1, 1}, test_ssm_conv_tree::ROOTS));
+    test_cases.emplace_back(new test_ssm_conv_tree(GGML_TYPE_F32, {10, 128, 2, 1}, {4, 128, 1, 1}, test_ssm_conv_tree::BRANCH));
+    // d_conv=9 exercises the long-kernel CUDA launch variant.
+    test_cases.emplace_back(new test_ssm_conv_tree(GGML_TYPE_F32, {16, 128, 1, 1}, {9, 128, 1, 1}, test_ssm_conv_tree::CHAIN));
+
+    // gated_delta_net_ex: chain+persist, tree_chain (must match chain), tree_branch.
+    // S_v=32/64/128 covers the three CUDA template instantiations used in production.
+    test_cases.emplace_back(new test_gated_delta_net_ex(GGML_TYPE_F32, GGML_TYPE_F32, 4, 32,  4, 1, false, test_gated_delta_net_ex::CHAIN_PERSIST));
+    test_cases.emplace_back(new test_gated_delta_net_ex(GGML_TYPE_F32, GGML_TYPE_F32, 4, 32,  4, 1, false, test_gated_delta_net_ex::TREE_CHAIN));
+    test_cases.emplace_back(new test_gated_delta_net_ex(GGML_TYPE_F32, GGML_TYPE_F32, 4, 32,  4, 1, false, test_gated_delta_net_ex::TREE_BRANCH));
+    test_cases.emplace_back(new test_gated_delta_net_ex(GGML_TYPE_F32, GGML_TYPE_F32, 4, 64,  4, 1, false, test_gated_delta_net_ex::TREE_BRANCH));
+    test_cases.emplace_back(new test_gated_delta_net_ex(GGML_TYPE_F32, GGML_TYPE_F32, 4, 128, 4, 1, false, test_gated_delta_net_ex::TREE_BRANCH));
+    // f16 persist buffer — halves intermediate memory, exercises __half load/store paths.
+    test_cases.emplace_back(new test_gated_delta_net_ex(GGML_TYPE_F32, GGML_TYPE_F16, 4, 64,  4, 1, false, test_gated_delta_net_ex::TREE_BRANCH));
+    // KDA gate variant.
+    test_cases.emplace_back(new test_gated_delta_net_ex(GGML_TYPE_F32, GGML_TYPE_F32, 4, 64,  4, 1, true,  test_gated_delta_net_ex::TREE_BRANCH));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
