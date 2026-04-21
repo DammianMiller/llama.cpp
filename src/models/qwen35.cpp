@@ -283,7 +283,17 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     // verify-cache: persist the conv_input for replay-free rollback (no-op when disabled)
     build_persist_conv_input(gf, il, conv_input);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    // DDTree verify: route conv through ggml_ssm_conv_tree when a tree
+    // descriptor is pending. Bit-identical to ggml_ssm_conv when not tree mode.
+    ggml_tensor * conv_output_proper;
+    if (tree_verify_pending) {
+        const auto tv = build_inp_tree_verify();
+        conv_output_proper = tv.first != nullptr
+            ? ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, tv.first)
+            : ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    } else {
+        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    }
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);

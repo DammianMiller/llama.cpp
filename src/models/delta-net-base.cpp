@@ -467,9 +467,15 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         (void) hictx;
     }
 
-    // Phase 2: chain mode only — parent_ids stays nullptr. Phase 5 will pass
-    // a DDTree parent_ids tensor through the same helper.
-    ggml_tensor * result = build_gated_delta_net(il, q, k, v, g, b, s, /*parent_ids=*/nullptr, persist_inter);
+    // DDTree verify (Phase 5): when a tree-verify descriptor is pending on
+    // the context, route the parent_ids tensor into the gated_delta_net_ex
+    // tree mode. Otherwise stays in chain mode (bit-identical to master).
+    ggml_tensor * tree_parent_ids = nullptr;
+    if (tree_verify_pending && persist_inter != nullptr) {
+        const auto tv = build_inp_tree_verify();
+        tree_parent_ids = tv.first;
+    }
+    ggml_tensor * result = build_gated_delta_net(il, q, k, v, g, b, s, tree_parent_ids, persist_inter);
 
     ggml_tensor * output = ggml_view_4d(ctx0, result,
             S_v, H_v, n_tokens, n_seqs,

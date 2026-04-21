@@ -511,6 +511,37 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
+// DDTree verify descriptor (Phase 5D). Owns two input tensors:
+//   parent_ids : I32 [n_tokens]              — flat-tree parents
+//   tree_mask  : F16 [mask_kv_pad, mask_q_pad] — ancestor-only attn mask
+// set_input copies from the borrowed CPU data pointers into the tensors.
+class llm_graph_input_tree_verify : public llm_graph_input_i {
+public:
+    llm_graph_input_tree_verify(
+            int              n_tokens,
+            int              mask_kv_pad,
+            int              mask_q_pad,
+            const int32_t *  parent_ids_data,
+            const uint16_t * mask_f16_data) :
+        n_tokens(n_tokens),
+        mask_kv_pad(mask_kv_pad),
+        mask_q_pad(mask_q_pad),
+        parent_ids_data(parent_ids_data),
+        mask_f16_data(mask_f16_data) { }
+    virtual ~llm_graph_input_tree_verify() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * parent_ids = nullptr;  // I32 [n_tokens]
+    ggml_tensor * tree_mask  = nullptr;  // F16 [mask_kv_pad, mask_q_pad]
+
+    const int        n_tokens;
+    const int        mask_kv_pad;
+    const int        mask_q_pad;
+    const int32_t *  parent_ids_data; // borrowed — lives as long as the ctx descriptor
+    const uint16_t * mask_f16_data;   // borrowed
+};
+
 //
 // llm_graph_result
 //
@@ -566,6 +597,17 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    // Pending DDTree verify descriptor (one-shot). When tree_verify_pending
+    // is true, the graph builder routes the hybrid delta-net ops into their
+    // tree variants. Pointers are borrowed from llama_context::tree_verify
+    // and live for the duration of the graph build + compute.
+    bool             tree_verify_pending = false;
+    int              tree_n_tokens       = 0;
+    int              tree_mask_kv_pad    = 0;
+    int              tree_mask_q_pad     = 0;
+    const int32_t *  tree_parent_ids     = nullptr;
+    const uint16_t * tree_mask_f16       = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -765,6 +807,31 @@ struct llm_graph_context {
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+
+    //
+    // DDTree verify (Phase 5)
+    //
+    // tree_verify_pending and the four tree_* fields below are borrowed from
+    // llm_graph_params — set by llama_context::graph_params() when the
+    // context has a pending tree-verify descriptor. Tree-aware model graph
+    // builders check tree_verify_pending to decide whether to route through
+    // the tree-mode variants of the ops added in Phase 1.
+    bool             tree_verify_pending  = false;
+    int              tree_n_tokens        = 0;
+    int              tree_mask_kv_pad     = 0;
+    int              tree_mask_q_pad      = 0;
+    const int32_t *  tree_parent_ids_data = nullptr;
+    const uint16_t * tree_mask_f16_data   = nullptr;
+
+    // Lazy cache for the parent_ids + tree_mask input tensors — populated on
+    // first call to build_inp_tree_verify() and reused across the graph.
+    mutable ggml_tensor * tree_parent_ids_t = nullptr;
+    mutable ggml_tensor * tree_mask_t       = nullptr;
+
+    // Returns (parent_ids, tree_mask). Both are nullptr if the graph has no
+    // pending tree-verify. Registers the input with `res` the first time it
+    // is called; subsequent calls return cached tensors.
+    std::pair<ggml_tensor *, ggml_tensor *> build_inp_tree_verify() const;
 
     //
     // common

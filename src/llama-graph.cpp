@@ -951,6 +951,17 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
+
+        // DDTree verify descriptor (Phase 5D): copy the one-shot pointers
+        // forwarded through llm_graph_params. tree_verify_pending stays
+        // false on normal (non-tree-verify) decodes, in which case all the
+        // helpers below are no-ops.
+        tree_verify_pending  = params.tree_verify_pending;
+        tree_n_tokens        = params.tree_n_tokens;
+        tree_mask_kv_pad     = params.tree_mask_kv_pad;
+        tree_mask_q_pad      = params.tree_mask_q_pad;
+        tree_parent_ids_data = params.tree_parent_ids;
+        tree_mask_f16_data   = params.tree_mask_f16;
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
@@ -1719,6 +1730,50 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
     return cur;
 }
 
+std::pair<ggml_tensor *, ggml_tensor *> llm_graph_context::build_inp_tree_verify() const {
+    if (!tree_verify_pending) {
+        return {nullptr, nullptr};
+    }
+
+    // Cached on first call for this graph.
+    if (tree_parent_ids_t && tree_mask_t) {
+        return {tree_parent_ids_t, tree_mask_t};
+    }
+
+    auto inp = std::make_unique<llm_graph_input_tree_verify>(
+        tree_n_tokens, tree_mask_kv_pad, tree_mask_q_pad,
+        tree_parent_ids_data, tree_mask_f16_data);
+
+    inp->parent_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, tree_n_tokens);
+    ggml_set_name(inp->parent_ids, "tree_parent_ids");
+    ggml_set_input(inp->parent_ids);
+
+    // Mask layout: [kv_pad, q_pad]. Dim 0 (kv) is fast-varying (matches
+    // ggml_flash_attn_ext's [n_kv, n_batch, ...] convention).
+    inp->tree_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, tree_mask_kv_pad, tree_mask_q_pad);
+    ggml_set_name(inp->tree_mask, "tree_mask");
+    ggml_set_input(inp->tree_mask);
+
+    tree_parent_ids_t = inp->parent_ids;
+    tree_mask_t       = inp->tree_mask;
+
+    res->add_input(std::move(inp));
+
+    return {tree_parent_ids_t, tree_mask_t};
+}
+
+void llm_graph_input_tree_verify::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (parent_ids && parent_ids_data) {
+        ggml_backend_tensor_set(parent_ids, parent_ids_data,
+                                0, (size_t)n_tokens * sizeof(int32_t));
+    }
+    if (tree_mask && mask_f16_data) {
+        ggml_backend_tensor_set(tree_mask, mask_f16_data,
+                                0, (size_t)mask_kv_pad * mask_q_pad * sizeof(uint16_t));
+    }
+}
+
 ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     auto inp = std::make_unique<llm_graph_input_attn_temp>(hparams.n_attn_temp_floor_scale, hparams.f_attn_temp_scale, hparams.f_attn_temp_offset);
 
@@ -2132,7 +2187,17 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask();
+    auto kq_mask = inp->get_kq_mask();
+
+    // DDTree verify: override the default causal mask with the ancestor-only
+    // mask supplied via llama_set_tree_verify(). The ancestor-only mask
+    // spans the full [kv_pad, q_pad] of the verify batch and is already F16.
+    if (tree_verify_pending) {
+        const auto tv = build_inp_tree_verify();
+        if (tv.second != nullptr) {
+            kq_mask = tv.second;
+        }
+    }
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
