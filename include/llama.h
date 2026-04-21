@@ -796,13 +796,20 @@ extern "C" {
 
     LLAMA_API void llama_memory_disable_verify_cache(llama_memory_t mem);
 
-    // Roll the SSM recurrent state of seq_id back to the slot captured during
-    // the last verify forward. commit_n is 1-based: 1..max_verify_tokens.
-    // Updates conv_state and ssm_state in place. No-op if the verify cache is
-    // disabled or the sequence has no active cell.
+    // Roll the hybrid memory back to the slot captured during the last verify
+    // forward. Must be called AFTER a verify forward that ran exactly
+    // n_verify tokens into the sequence. commit_n is 1-based (1..n_verify)
+    // and gives the number of accepted tokens.
+    //
+    // Updates conv_state and ssm_state in place from the persistent verify
+    // cache, and trims the attention KV to match. Replaces the seq_rm +
+    // activation-replay path for hybrid models when the verify cache is
+    // enabled. No-op if the verify cache is disabled or the sequence has no
+    // active cell.
     LLAMA_API void llama_memory_rollback_to_verify_slot(
             llama_memory_t mem,
               llama_seq_id seq_id,
+                       int n_verify,
                        int commit_n);
 
     //

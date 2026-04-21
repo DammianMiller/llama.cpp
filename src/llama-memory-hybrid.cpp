@@ -647,12 +647,16 @@ ggml_tensor * llama_memory_hybrid::get_ssm_intermediate(int32_t il) const {
     return ssm_intermediate[il];
 }
 
-void llama_memory_hybrid::rollback_to_verify_slot(llama_seq_id seq_id, int commit_n) {
+void llama_memory_hybrid::rollback_to_verify_slot(llama_seq_id seq_id, int n_verify, int commit_n) {
     if (!m_verify_cache_enabled) {
         return;
     }
-    if (commit_n <= 0 || commit_n > m_max_verify_tokens) {
-        LLAMA_LOG_WARN("%s: commit_n %d out of range [1, %d]\n", __func__, commit_n, m_max_verify_tokens);
+    if (n_verify <= 0 || n_verify > m_max_verify_tokens) {
+        LLAMA_LOG_WARN("%s: n_verify %d out of range [1, %d]\n", __func__, n_verify, m_max_verify_tokens);
+        return;
+    }
+    if (commit_n <= 0 || commit_n > n_verify) {
+        LLAMA_LOG_WARN("%s: commit_n %d out of range [1, %d]\n", __func__, commit_n, n_verify);
         return;
     }
 
@@ -770,10 +774,21 @@ void llama_memory_hybrid::rollback_to_verify_slot(llama_seq_id seq_id, int commi
         }
     }
 
-    // Reset cell position to reflect that `commit_n` tokens have been accepted
-    // from the verify forward; caller should already have the matching attn
-    // seq_rm queued or in flight.
-    mem_recr->cells[tail_id].pos = best_pos - (m_max_verify_tokens - commit_n);
-    LLAMA_LOG_DEBUG("%s: seq %d rolled back to commit_n=%d slot (pos %d)\n",
-            __func__, seq_id, commit_n, mem_recr->cells[tail_id].pos);
+    // Reset recurrent cell position to reflect that `commit_n` of the last
+    // `n_verify` tokens have been accepted.
+    const llama_pos new_pos = best_pos - (llama_pos) (n_verify - commit_n);
+    mem_recr->cells[tail_id].pos = new_pos;
+
+    // Trim the attention KV to match: drop any cells with pos > new_pos for
+    // this sequence. This keeps both caches in sync, replacing the
+    // seq_rm + activation-replay sequence the caller would otherwise run.
+    // mem_attn->seq_rm may partially succeed on hybrid attn cells (full-attn
+    // layers store their own KV), but the hybrid spec-decode flow never has
+    // a checkpoint on the attn side so the contiguous trim path is fine.
+    if (mem_attn) {
+        mem_attn->seq_rm(seq_id, new_pos + 1, -1);
+    }
+
+    LLAMA_LOG_DEBUG("%s: seq %d rolled back to commit_n=%d / n_verify=%d slot (pos %d)\n",
+            __func__, seq_id, commit_n, n_verify, new_pos);
 }

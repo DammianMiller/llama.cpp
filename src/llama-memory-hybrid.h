@@ -104,7 +104,7 @@ public:
     // commit_n is 1-based (1..max_verify_tokens). No-op if verify cache is
     // disabled, the buffer wasn't populated (no verify forward ran), or the
     // sequence has no active cell.
-    void rollback_to_verify_slot(llama_seq_id seq_id, int commit_n);
+    void rollback_to_verify_slot(llama_seq_id seq_id, int n_verify, int commit_n);
 
 private:
     const llama_hparams & hparams;

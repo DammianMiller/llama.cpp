@@ -3339,12 +3339,13 @@ void llama_memory_disable_verify_cache(llama_memory_t mem) {
     }
 }
 
-void llama_memory_rollback_to_verify_slot(llama_memory_t mem, llama_seq_id seq_id, int commit_n) {
+void llama_memory_rollback_to_verify_slot(
+        llama_memory_t mem, llama_seq_id seq_id, int n_verify, int commit_n) {
     if (!mem) {
         return;
     }
     if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
-        hybrid->rollback_to_verify_slot(seq_id, commit_n);
+        hybrid->rollback_to_verify_slot(seq_id, n_verify, commit_n);
     }
 }
 
