@@ -60,7 +60,43 @@ llama_memory_hybrid::llama_memory_hybrid(
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recurrent(il); }
             : filter_recr
-    )) {}
+    ))
+{
+    // Cache per-layer buft and delta-net dimensions up front so enable_verify_cache()
+    // can allocate persist buffers without needing a live llama_model reference.
+    const int32_t n_layer = hparams.n_layer;
+    layer_buft.assign(n_layer, nullptr);
+    layer_dims_arr.assign(n_layer, layer_dims{0, 0, 0, 0});
+    m_verify_n_seqs = n_seq_max;
+
+    for (int32_t il = 0; il < n_layer; ++il) {
+        if (!hparams.is_recurrent(il)) {
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        if (offload) {
+            buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
+        }
+        layer_buft[il] = buft;
+
+        // Matches qwen35/qwen35moe/qwen3next graph builders: S_v = ssm_d_inner / ssm_dt_rank,
+        // H = ssm_dt_rank, conv_channels = ssm_d_inner + 2 * ssm_n_group * ssm_d_state.
+        // For non-delta-net recurrent layers (e.g. plain mamba), these aren't used;
+        // enable_verify_cache() will simply skip allocating persist tensors when H == 0.
+        const int64_t d_inner      = hparams.ssm_d_inner;
+        const int64_t num_v_heads  = hparams.ssm_dt_rank;
+        const int64_t head_v_dim   = num_v_heads > 0 ? d_inner / num_v_heads : 0;
+        layer_dims_arr[il] = layer_dims{
+            /*S_v          */ head_v_dim,
+            /*H            */ num_v_heads,
+            /*conv_channels*/ (int64_t) d_inner + 2 * (int64_t) hparams.ssm_n_group * (int64_t) hparams.ssm_d_state,
+            /*d_conv       */ (int64_t) hparams.ssm_d_conv,
+        };
+    }
+
+    ssm_intermediate.assign(n_layer, nullptr);
+    conv_input_cache.assign(n_layer, nullptr);
+}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -408,6 +444,7 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :
+    mem(mem),
     ctx_attn(mem->get_mem_attn()->init_full()),
     ctx_recr(mem->get_mem_recr()->init_full()),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
@@ -417,6 +454,7 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
         llama_memory_hybrid * mem,
               llama_context * lctx,
                        bool   optimize) :
+    mem(mem),
     ctx_attn(mem->get_mem_attn()->init_update(lctx, optimize)),
     ctx_recr(mem->get_mem_recr()->init_update(lctx, optimize)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
@@ -427,6 +465,7 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
                   slot_info_vec_t   sinfos_attn,
         std::vector<llama_ubatch>   ubatches) :
     ubatches(std::move(ubatches)),
+    mem(mem),
     // note: here we copy the ubatches. not sure if this is ideal
     ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches)),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
@@ -472,4 +511,269 @@ const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
+}
+
+
+ggml_tensor * llama_memory_hybrid_context::get_ssm_intermediate(int32_t il) const {
+    return mem ? mem->get_ssm_intermediate(il) : nullptr;
+}
+
+//
+// verify-cache (Phase 2) — persist buffers for speculative decoding rollback
+//
+
+bool llama_memory_hybrid::enable_verify_cache(int max_verify_tokens, ggml_type persist_type) {
+    if (max_verify_tokens <= 0) {
+        LLAMA_LOG_WARN("%s: max_verify_tokens must be > 0\n", __func__);
+        return false;
+    }
+    if (persist_type != GGML_TYPE_F32 && persist_type != GGML_TYPE_F16) {
+        LLAMA_LOG_WARN("%s: persist_type must be F32 or F16\n", __func__);
+        return false;
+    }
+
+    // Find recurrent layers that look like gated-delta-net (H > 0 && S_v > 0).
+    std::vector<int32_t> gdn_layers;
+    for (int32_t il = 0; il < (int32_t) layer_dims_arr.size(); ++il) {
+        const auto & d = layer_dims_arr[il];
+        if (d.H > 0 && d.S_v > 0) {
+            gdn_layers.push_back(il);
+        }
+    }
+    if (gdn_layers.empty()) {
+        LLAMA_LOG_WARN("%s: model has no gated-delta-net layers; verify cache not enabled\n", __func__);
+        return false;
+    }
+
+    // Idempotent: if already enabled with >= budget and same dtype, do nothing.
+    if (m_verify_cache_enabled && persist_type == m_persist_type && max_verify_tokens <= m_max_verify_tokens) {
+        return true;
+    }
+
+    // Reallocate: drop existing buffers first so the old ones are freed before
+    // we try to allocate new ones.
+    disable_verify_cache();
+
+    const int32_t n_layer = hparams.n_layer;
+    ssm_intermediate.assign(n_layer, nullptr);
+    conv_input_cache.assign(n_layer, nullptr);
+
+    struct buft_ctx {
+        ggml_context_ptr ctx;
+    };
+    // key: buft pointer, value: ggml_context holding tensors for layers on that buft
+    std::map<ggml_backend_buffer_type_t, buft_ctx> ctx_map;
+
+    // Count per-buft tensors up front so we can size each ggml_context correctly
+    // (2 tensors per gdn layer). Non-gdn recurrent layers get no persist tensor.
+    std::map<ggml_backend_buffer_type_t, int32_t> tensors_per_buft;
+    for (int32_t il : gdn_layers) {
+        tensors_per_buft[layer_buft[il]] += 2;
+    }
+
+    for (auto & [buft, n_t] : tensors_per_buft) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ size_t(n_t * ggml_tensor_overhead()),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) {
+            LLAMA_LOG_ERROR("%s: failed to create ggml context for verify cache\n", __func__);
+            disable_verify_cache();
+            return false;
+        }
+        ctx_map[buft].ctx.reset(ctx);
+    }
+
+    for (int32_t il : gdn_layers) {
+        const auto & d = layer_dims_arr[il];
+        ggml_context * ctx = ctx_map[layer_buft[il]].ctx.get();
+
+        // ssm_intermediate: one S_v*S_v state matrix per (head, token, seq).
+        ggml_tensor * t_inter = ggml_new_tensor_4d(
+            ctx, persist_type,
+            d.S_v * d.S_v, d.H, (int64_t) max_verify_tokens, (int64_t) m_verify_n_seqs);
+        ggml_format_name(t_inter, "verify_ssm_inter_l%d", il);
+        ssm_intermediate[il] = t_inter;
+
+        // conv_input_cache: [(d_conv - 1) + max_verify_tokens, conv_channels].
+        // Always F32 — matches qkv_mixed dtype in the graph builder.
+        const int64_t conv_window = (d.d_conv > 0 ? d.d_conv - 1 : 0) + max_verify_tokens;
+        ggml_tensor * t_conv = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32,
+            conv_window, d.conv_channels);
+        ggml_format_name(t_conv, "verify_conv_in_l%d", il);
+        conv_input_cache[il] = t_conv;
+    }
+
+    // Allocate backend buffers.
+    for (auto & [buft, entry] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(entry.ctx.get(), buft);
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate verify cache buffer for %s\n", __func__, ggml_backend_buft_name(buft));
+            disable_verify_cache();
+            return false;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        LLAMA_LOG_INFO("%s: %10s verify cache buffer size = %8.2f MiB\n",
+                __func__, ggml_backend_buffer_name(buf),
+                ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        verify_ctxs_bufs.emplace_back(std::move(entry.ctx), ggml_backend_buffer_ptr(buf));
+    }
+
+    m_verify_cache_enabled = true;
+    m_max_verify_tokens    = max_verify_tokens;
+    m_persist_type         = persist_type;
+    return true;
+}
+
+void llama_memory_hybrid::disable_verify_cache() {
+    // ctxs_bufs destructor frees tensors + buffers.
+    verify_ctxs_bufs.clear();
+    std::fill(ssm_intermediate.begin(), ssm_intermediate.end(), nullptr);
+    std::fill(conv_input_cache.begin(), conv_input_cache.end(), nullptr);
+    m_verify_cache_enabled = false;
+    m_max_verify_tokens    = 0;
+}
+
+ggml_tensor * llama_memory_hybrid::get_ssm_intermediate(int32_t il) const {
+    if (!m_verify_cache_enabled) {
+        return nullptr;
+    }
+    if (il < 0 || il >= (int32_t) ssm_intermediate.size()) {
+        return nullptr;
+    }
+    return ssm_intermediate[il];
+}
+
+void llama_memory_hybrid::rollback_to_verify_slot(llama_seq_id seq_id, int commit_n) {
+    if (!m_verify_cache_enabled) {
+        return;
+    }
+    if (commit_n <= 0 || commit_n > m_max_verify_tokens) {
+        LLAMA_LOG_WARN("%s: commit_n %d out of range [1, %d]\n", __func__, commit_n, m_max_verify_tokens);
+        return;
+    }
+
+    // Locate the cell for this sequence.
+    int32_t tail_id = -1;
+    llama_pos best_pos = -1;
+    for (uint32_t i = 0; i < mem_recr->size; ++i) {
+        const auto & cell = mem_recr->cells[i];
+        if (cell.has_seq_id(seq_id) && !cell.is_empty() && cell.pos > best_pos) {
+            tail_id = (int32_t) i;
+            best_pos = cell.pos;
+        }
+    }
+    if (tail_id < 0) {
+        return;
+    }
+
+    // Slot index (0-based) inside the intermediate buffer.
+    const int slot = commit_n - 1;
+
+    // Scratch for f16 -> f32 conversion when persist_type != type_s.
+    std::vector<uint8_t> scratch_src;
+    std::vector<uint8_t> scratch_dst;
+
+    for (int32_t il = 0; il < (int32_t) ssm_intermediate.size(); ++il) {
+        ggml_tensor * inter = ssm_intermediate[il];
+        if (inter == nullptr) {
+            continue;
+        }
+        ggml_tensor * s_dst = mem_recr->s_l[il];
+        if (s_dst == nullptr) {
+            continue;
+        }
+
+        const auto & d = layer_dims_arr[il];
+        const size_t slot_elems = (size_t) d.S_v * d.S_v * d.H * m_verify_n_seqs;
+        const size_t slot_src_bytes = slot_elems * ggml_type_size(inter->type);
+
+        // Offset within persist tensor: [S_v*S_v, H, slot, :] -> skip `slot * S_v*S_v * H` elems.
+        const size_t inter_slot_stride = (size_t) d.S_v * d.S_v * d.H * ggml_type_size(inter->type);
+        const size_t inter_offset = (size_t) slot * inter_slot_stride;
+
+        // Offset within s_l: row `tail_id` of [n_embd_s, mem_size].
+        const size_t s_row_size = ggml_row_size(s_dst->type, hparams.n_embd_s());
+        const size_t s_offset   = (size_t) tail_id * s_row_size;
+
+        if (inter->type == s_dst->type) {
+            scratch_src.resize(slot_src_bytes);
+            ggml_backend_tensor_get(inter, scratch_src.data(), inter_offset, slot_src_bytes);
+            ggml_backend_tensor_set(s_dst, scratch_src.data(), s_offset, slot_src_bytes);
+        } else {
+            // Cross-dtype path — read persist, convert to dst dtype, write back.
+            scratch_src.resize(slot_src_bytes);
+            ggml_backend_tensor_get(inter, scratch_src.data(), inter_offset, slot_src_bytes);
+
+            const size_t slot_dst_bytes = slot_elems * ggml_type_size(s_dst->type);
+            scratch_dst.resize(slot_dst_bytes);
+
+            if (inter->type == GGML_TYPE_F16 && s_dst->type == GGML_TYPE_F32) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) scratch_src.data(),
+                                      (float *) scratch_dst.data(), slot_elems);
+            } else if (inter->type == GGML_TYPE_F32 && s_dst->type == GGML_TYPE_F16) {
+                ggml_fp32_to_fp16_row((const float *) scratch_src.data(),
+                                      (ggml_fp16_t *) scratch_dst.data(), slot_elems);
+            } else {
+                LLAMA_LOG_WARN("%s: unsupported persist/state dtype pair (layer %d)\n", __func__, il);
+                continue;
+            }
+            ggml_backend_tensor_set(s_dst, scratch_dst.data(), s_offset, slot_dst_bytes);
+        }
+
+        // conv_input_cache -> conv_state slice: take rows [commit_n .. commit_n + d_conv - 1)
+        // from conv_input_cache[il] and write into r_l[il] for this cell.
+        ggml_tensor * conv_in = conv_input_cache[il];
+        ggml_tensor * r_dst   = mem_recr->r_l[il];
+        if (conv_in == nullptr || r_dst == nullptr) {
+            continue;
+        }
+        const int64_t d_conv_m1 = d.d_conv > 0 ? d.d_conv - 1 : 0;
+        if (d_conv_m1 == 0) {
+            continue;
+        }
+        // conv_input_cache layout: [conv_window, conv_channels], F32, row-major on dim 0.
+        // We want rows [slot+1 .. slot+1 + d_conv_m1) across all conv_channels columns.
+        // The destination (r_l) stores each cell's conv state flattened as
+        //   row_stride = n_embd_r() = d_conv_m1 * conv_channels  (dtype type_r).
+        const size_t r_row_size = ggml_row_size(r_dst->type, hparams.n_embd_r());
+        const size_t r_offset   = (size_t) tail_id * r_row_size;
+
+        // Read the required window from persist (F32).
+        const size_t conv_slot_elems = (size_t) d_conv_m1 * d.conv_channels;
+        scratch_src.resize(conv_slot_elems * sizeof(float));
+        // conv_in strides: ne[0] = conv_window, ne[1] = conv_channels. We need
+        // a rectangular block [slot+1 .. slot+1+d_conv_m1) x [0 .. conv_channels).
+        // ggml stores dim 0 contiguous, so columns are separated by ne[0] * sizeof(float).
+        const size_t row0_offset = (size_t) ((slot + 1)) * sizeof(float);
+        const size_t col_stride  = (size_t) conv_in->ne[0] * sizeof(float);
+        for (int64_t c = 0; c < d.conv_channels; ++c) {
+            ggml_backend_tensor_get(
+                conv_in,
+                scratch_src.data() + (size_t) c * d_conv_m1 * sizeof(float),
+                row0_offset + (size_t) c * col_stride,
+                (size_t) d_conv_m1 * sizeof(float));
+        }
+
+        if (r_dst->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(r_dst, scratch_src.data(), r_offset, r_row_size);
+        } else if (r_dst->type == GGML_TYPE_F16) {
+            scratch_dst.resize(conv_slot_elems * sizeof(ggml_fp16_t));
+            ggml_fp32_to_fp16_row((const float *) scratch_src.data(),
+                                  (ggml_fp16_t *) scratch_dst.data(), conv_slot_elems);
+            ggml_backend_tensor_set(r_dst, scratch_dst.data(), r_offset, r_row_size);
+        } else {
+            LLAMA_LOG_WARN("%s: unsupported conv state dtype for layer %d\n", __func__, il);
+        }
+    }
+
+    // Reset cell position to reflect that `commit_n` tokens have been accepted
+    // from the verify forward; caller should already have the matching attn
+    // seq_rm queued or in flight.
+    mem_recr->cells[tail_id].pos = best_pos - (m_max_verify_tokens - commit_n);
+    LLAMA_LOG_DEBUG("%s: seq %d rolled back to commit_n=%d slot (pos %d)\n",
+            __func__, seq_id, commit_n, mem_recr->cells[tail_id].pos);
 }
