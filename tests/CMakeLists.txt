@@ -199,6 +199,7 @@ llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-ddtree.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
+llama_build_and_test(test-ngram-mod.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
