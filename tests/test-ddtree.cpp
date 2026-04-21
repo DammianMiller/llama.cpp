@@ -1,6 +1,8 @@
 #include "ddtree.h"
 #include "ngram-mod.h"
 
+#include "ggml.h"   // ggml_fp16_to_fp32 for mask decoding
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -229,6 +231,288 @@ static void test_k1_matches_get() {
     fprintf(stdout, "  test_k1_matches_get: ok\n");
 }
 
+//
+// DDTree builder/follow/mask tests
+//
+
+// Build a fully controlled `common_draft_topk_pos` fixture manually.
+// Unpopulated slots default to (id=-1, log_prob=-INF).
+static common_draft_topk_pos make_pos(std::initializer_list<std::pair<int32_t, float>> entries) {
+    common_draft_topk_pos p;
+    for (int k = 0; k < common_draft_topk_pos::K; ++k) {
+        p.ids[k]       = -1;
+        p.log_probs[k] = -INFINITY;
+    }
+    int k = 0;
+    for (const auto & e : entries) {
+        if (k >= common_draft_topk_pos::K) break;
+        p.ids[k]       = e.first;
+        p.log_probs[k] = e.second;
+        ++k;
+    }
+    return p;
+}
+
+static void test_build_degenerate() {
+    // budget = 0 — root-only tree, no nodes.
+    std::vector<common_draft_topk_pos> topk;
+    topk.push_back(make_pos({ { 11, -0.1f } }));
+
+    const common_ddtree tree = common_ddtree_build(topk, 0, true);
+    TEST_CHECK(tree.n_nodes == 0);
+    TEST_CHECK(tree.token_ids.empty());
+    TEST_CHECK(tree.depths.empty());
+    TEST_CHECK(tree.parents.size() == 1);
+    TEST_CHECK(tree.parents[0] == -1);
+    TEST_CHECK(tree.child_maps.size() == 1);
+    TEST_CHECK(tree.child_maps[0].empty());
+    TEST_CHECK(tree.visibility.size() == 1);
+    TEST_CHECK(tree.visibility[0] == 1);
+
+    // Empty topk, positive budget — still degenerate.
+    const common_ddtree tree2 = common_ddtree_build({}, 4, true);
+    TEST_CHECK(tree2.n_nodes == 0);
+    TEST_CHECK(tree2.visibility.size() == 1);
+    TEST_CHECK(tree2.visibility[0] == 1);
+
+    fprintf(stdout, "  test_build_degenerate: ok\n");
+}
+
+static void test_build_chain() {
+    // topk with only top-1 populated — chain_seed produces a pure chain.
+    std::vector<common_draft_topk_pos> topk;
+    for (int d = 0; d < 6; ++d) {
+        topk.push_back(make_pos({ { d + 1, -0.1f } }));
+    }
+
+    const int budget = 4;
+    const common_ddtree tree = common_ddtree_build(topk, budget, true);
+
+    TEST_CHECK(tree.n_nodes == budget);
+    TEST_CHECK((int) tree.token_ids.size() == budget);
+    TEST_CHECK((int) tree.depths.size()    == budget);
+    TEST_CHECK((int) tree.parents.size()   == budget + 1);
+    TEST_CHECK(tree.parents[0] == -1);
+
+    // chain: parents[i+1] == i, token_ids[i] == i+1, depths[i] == i+1.
+    for (int i = 0; i < budget; ++i) {
+        TEST_CHECK(tree.parents[i + 1] == i);
+        TEST_CHECK(tree.token_ids[i]   == i + 1);
+        TEST_CHECK(tree.depths[i]      == i + 1);
+    }
+
+    // Visibility: each node sees root + its chain-of-ancestors + self.
+    const int N = 1 + tree.n_nodes;
+    for (int i = 0; i < N; ++i) {
+        // root is an ancestor of every node.
+        TEST_CHECK(tree.visibility[(size_t) i * N + 0] == 1);
+        // self-visibility.
+        TEST_CHECK(tree.visibility[(size_t) i * N + i] == 1);
+        // ancestors on the chain.
+        for (int j = 1; j <= i; ++j) {
+            TEST_CHECK(tree.visibility[(size_t) i * N + j] == 1);
+        }
+        // no forward visibility.
+        for (int j = i + 1; j < N; ++j) {
+            TEST_CHECK(tree.visibility[(size_t) i * N + j] == 0);
+        }
+    }
+
+    fprintf(stdout, "  test_build_chain: ok\n");
+}
+
+static void test_build_branching() {
+    // Two depths both with K=2 real entries — budget=6 forces the heap to
+    // expand siblings AND extend the chain, giving a branching tree.
+    std::vector<common_draft_topk_pos> topk;
+    topk.push_back(make_pos({ { 100, -0.1f }, { 101, -1.0f } }));
+    topk.push_back(make_pos({ { 200, -0.2f }, { 201, -1.5f } }));
+    topk.push_back(make_pos({ { 300, -0.3f }                 }));
+
+    const int budget = 6;
+    const common_ddtree tree = common_ddtree_build(topk, budget, true);
+
+    TEST_CHECK(tree.n_nodes > 0);
+    TEST_CHECK(tree.n_nodes <= budget);
+
+    // There must be at least one non-linear parent relationship, i.e. some
+    // node i (>= 2) whose parent is NOT i-1. chain-only would give
+    // parents[i+1] == i for every i.
+    bool has_branch = false;
+    for (int i = 0; i < tree.n_nodes; ++i) {
+        if (tree.parents[i + 1] != i) {
+            has_branch = true;
+            break;
+        }
+    }
+    TEST_CHECK(has_branch);
+
+    // Ancestry sanity: every node must be visible to itself and to the root.
+    const int N = 1 + tree.n_nodes;
+    for (int i = 0; i < N; ++i) {
+        TEST_CHECK(tree.visibility[(size_t) i * N + 0] == 1);
+        TEST_CHECK(tree.visibility[(size_t) i * N + i] == 1);
+    }
+
+    // Each child_map entry must resolve to a node whose parent is this node.
+    for (int i = 0; i < N; ++i) {
+        for (const auto & kv : tree.child_maps[i]) {
+            const int child = kv.second;
+            TEST_CHECK(child > 0 && child < N);
+            TEST_CHECK(tree.parents[child] == i);
+            TEST_CHECK(tree.token_ids[child - 1] == kv.first);
+        }
+    }
+
+    fprintf(stdout, "  test_build_branching: ok\n");
+}
+
+static void test_parent_ids_sentinel() {
+    // build_chain-style tree, but use a branching tree so there are multiple
+    // nodes with parent == root (produce -1 sentinels).
+    std::vector<common_draft_topk_pos> topk;
+    topk.push_back(make_pos({ { 10, -0.1f }, { 11, -0.2f }, { 12, -0.3f } }));
+    topk.push_back(make_pos({ { 20, -0.1f }                              }));
+
+    const common_ddtree tree = common_ddtree_build(topk, 5, true);
+    TEST_CHECK(tree.n_nodes > 0);
+
+    const auto parent_ids = common_ddtree_parent_ids(tree);
+    TEST_CHECK((int) parent_ids.size() == tree.n_nodes);
+
+    int n_root_children = 0;
+    for (int i = 0; i < tree.n_nodes; ++i) {
+        const int p = tree.parents[i + 1];
+        TEST_CHECK(parent_ids[i] == (int32_t) (p - 1));
+        if (p == 0) {
+            TEST_CHECK(parent_ids[i] == -1);
+            ++n_root_children;
+        }
+    }
+    TEST_CHECK(n_root_children >= 1);
+
+    fprintf(stdout, "  test_parent_ids_sentinel: ok\n");
+}
+
+static void test_follow_full_match() {
+    // 3-node chain; posterior at each node's argmax matches the next in
+    // the chain, so the walk consumes everything.
+    std::vector<common_draft_topk_pos> topk;
+    topk.push_back(make_pos({ { 1, -0.1f } }));
+    topk.push_back(make_pos({ { 2, -0.1f } }));
+    topk.push_back(make_pos({ { 3, -0.1f } }));
+
+    const common_ddtree tree = common_ddtree_build(topk, 3, true);
+    TEST_CHECK(tree.n_nodes == 3);
+
+    // posterior[0..2]: root predicts child token, node-at-depth-1 predicts
+    // child at depth-2, etc. node at depth-3 predicts a "bonus" we set to 99.
+    const int32_t posterior[4] = { 1, 2, 3, 99 };
+
+    int32_t next_tok = -123;
+    const auto accepted = common_ddtree_follow_verified(tree, posterior, next_tok);
+
+    TEST_CHECK(accepted.size() == 4);            // root + 3 matched children
+    TEST_CHECK(accepted[0] == 0);
+    TEST_CHECK(accepted[1] == 1);
+    TEST_CHECK(accepted[2] == 2);
+    TEST_CHECK(accepted[3] == 3);
+    TEST_CHECK(next_tok == 99);
+
+    fprintf(stdout, "  test_follow_full_match: ok\n");
+}
+
+static void test_follow_mismatch() {
+    // 3-node chain; posterior diverges at depth 3 (root=1, node1=2, node2=7).
+    std::vector<common_draft_topk_pos> topk;
+    topk.push_back(make_pos({ { 1, -0.1f } }));
+    topk.push_back(make_pos({ { 2, -0.1f } }));
+    topk.push_back(make_pos({ { 3, -0.1f } }));
+
+    const common_ddtree tree = common_ddtree_build(topk, 3, true);
+    TEST_CHECK(tree.n_nodes == 3);
+
+    // root accepts 1, node1 accepts 2, node2 predicts 7 which doesn't match
+    // any child of node2 -> stop. next_tok must be 7.
+    const int32_t posterior[4] = { 1, 2, 7, 99 };
+
+    int32_t next_tok = -123;
+    const auto accepted = common_ddtree_follow_verified(tree, posterior, next_tok);
+
+    TEST_CHECK(accepted.size() == 3);           // root + 2 matched children
+    TEST_CHECK(accepted[0] == 0);
+    TEST_CHECK(accepted[1] == 1);
+    TEST_CHECK(accepted[2] == 2);
+    TEST_CHECK(next_tok == 7);
+
+    fprintf(stdout, "  test_follow_mismatch: ok\n");
+}
+
+static void test_mask_shape_and_values() {
+    // tiny chain tree: 3 nodes, all in a line.
+    std::vector<common_draft_topk_pos> topk;
+    topk.push_back(make_pos({ { 1, -0.1f } }));
+    topk.push_back(make_pos({ { 2, -0.1f } }));
+    topk.push_back(make_pos({ { 3, -0.1f } }));
+
+    const common_ddtree tree = common_ddtree_build(topk, 3, true);
+    TEST_CHECK(tree.n_nodes == 3);
+
+    const int prompt_kv_start = 2;
+    const int kv_total        = 5;   // [0,1] = prompt prefix, [2..4] = block
+    const int n_tokens        = 3;   // queries: root is excluded — callers
+                                     // typically iterate over node flat 0..n_tokens-1.
+    const int kq_mask_pad     = 32;
+
+    const auto mask = common_ddtree_build_mask(tree, prompt_kv_start, kv_total, n_tokens, kq_mask_pad);
+
+    const int kv_pad = ((kv_total + kq_mask_pad - 1) / kq_mask_pad) * kq_mask_pad;
+    const int q_pad  = ((n_tokens + 31) / 32) * 32;
+    TEST_CHECK(kv_pad == 32);
+    TEST_CHECK(q_pad  == 32);
+    TEST_CHECK((int) mask.size() == q_pad * kv_pad);
+
+    const int N = 1 + tree.n_nodes;
+
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int k = 0; k < kv_total; ++k) {
+            const uint16_t raw = mask[(size_t) t * kv_pad + k];
+            const float    val = ggml_fp16_to_fp32(raw);
+
+            if (k < prompt_kv_start) {
+                TEST_CHECK(raw == 0x0000);
+                TEST_CHECK(val == 0.0f);
+                continue;
+            }
+
+            const int local = k - prompt_kv_start;
+            const bool visible = (local < n_tokens) &&
+                                 (tree.visibility[(size_t) t * N + local] != 0);
+            if (visible) {
+                TEST_CHECK(raw == 0x0000);
+                TEST_CHECK(val == 0.0f);
+            } else {
+                TEST_CHECK(raw == 0xFC00);
+                TEST_CHECK(std::isinf(val) && val < 0.0f);
+            }
+        }
+
+        // Positions in the KV padding past kv_total are -INF.
+        for (int k = kv_total; k < kv_pad; ++k) {
+            TEST_CHECK(mask[(size_t) t * kv_pad + k] == 0xFC00);
+        }
+    }
+
+    // Padding rows past n_tokens are entirely -INF.
+    for (int t = n_tokens; t < q_pad; ++t) {
+        for (int k = 0; k < kv_pad; ++k) {
+            TEST_CHECK(mask[(size_t) t * kv_pad + k] == 0xFC00);
+        }
+    }
+
+    fprintf(stdout, "  test_mask_shape_and_values: ok\n");
+}
+
 int main() {
     fprintf(stdout, "test-ddtree: running...\n");
 
@@ -238,6 +522,14 @@ int main() {
     test_chain_termination();
     test_roundtrip_against_get_topk();
     test_k1_matches_get();
+
+    test_build_degenerate();
+    test_build_chain();
+    test_build_branching();
+    test_parent_ids_sentinel();
+    test_follow_full_match();
+    test_follow_mismatch();
+    test_mask_shape_and_values();
 
     fprintf(stdout, "test-ddtree: all tests passed\n");
     return 0;
