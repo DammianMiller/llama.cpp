@@ -327,6 +327,17 @@ struct common_params_speculative {
 
     std::shared_ptr<common_ngram_mod> ngram_mod;
 
+    // DDTree (Phase 5/6) — tree-structured speculative verify over an
+    // ngram-mod drafter. When ddtree_enable is true and the target is a
+    // hybrid delta-net model, the server-side spec loop should build a
+    // DDTree via common_ddtree_build_from_ngram() + common_ddtree_*
+    // helpers, call llama_set_tree_verify() before each verify forward,
+    // and roll back via llama_memory_rollback_to_verify_slot().
+    bool     ddtree_enable      = false;
+    int32_t  ddtree_budget      = 22;   // max non-root tree nodes (default matches paper sweet-spot)
+    float    ddtree_temperature = 0.5f; // sharpens the ngram-derived draft distribution
+    float    ddtree_alpha       = 1.0f; // Laplace prior in the draft log-prob synthesis
+
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding           // NOLINT
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding          // NOLINT
 

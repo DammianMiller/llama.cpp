@@ -3554,6 +3554,47 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--spec-ddtree"},
+        "enable DDTree-style tree-structured speculative verify (only effective "
+        "with --spec-type ngram-mod targeting a hybrid delta-net model; see "
+        "common/ddtree.h for the integration helpers)",
+        [](common_params & params) {
+            params.speculative.ddtree_enable = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DDTREE"));
+    add_opt(common_arg(
+        {"--spec-ddtree-budget"}, "N",
+        string_format("DDTree verify budget (max non-root tree nodes per step, default: %d)", params.speculative.ddtree_budget),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 128) {
+                throw std::invalid_argument("DDTree budget must be between 1 and 128 inclusive");
+            }
+            params.speculative.ddtree_budget = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ddtree-temp"}, "T",
+        string_format("temperature for DDTree draft log-probs (T<1 sharpens; default: %.2f)", (double) params.speculative.ddtree_temperature),
+        [](common_params & params, const std::string & value) {
+            const float t = std::stof(value);
+            if (!(t > 0.0f)) {
+                throw std::invalid_argument("DDTree temperature must be positive");
+            }
+            params.speculative.ddtree_temperature = t;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ddtree-alpha"}, "A",
+        string_format("Laplace prior for DDTree draft log-probs (default: %.2f)", (double) params.speculative.ddtree_alpha),
+        [](common_params & params, const std::string & value) {
+            const float a = std::stof(value);
+            if (!(a >= 0.0f)) {
+                throw std::invalid_argument("DDTree alpha must be >= 0");
+            }
+            params.speculative.ddtree_alpha = a;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(
             "KV cache data type for K for the draft model\n"
