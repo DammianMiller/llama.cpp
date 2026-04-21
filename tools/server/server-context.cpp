@@ -9,6 +9,8 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "ddtree.h"
+#include "ngram-mod.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -154,6 +156,13 @@ struct server_slot {
     llama_token  sampled; // in speculative mode, this is the last accepted token
     llama_tokens drafted;
 
+    // DDTree speculative verify state (Phase 5/6). Populated in the draft-
+    // generation step when ddtree_enable is true; consumed in the accept
+    // step. `ddtree_active` acts like a one-shot flag parallel to `drafted`
+    // — cleared alongside it.
+    bool            ddtree_active = false;
+    common_ddtree   ddtree;
+
     // stats
     size_t n_sent_text = 0; // number of sent text character
 
@@ -184,6 +193,7 @@ struct server_slot {
 
         drafted.clear();
         i_batch_dft.clear();
+        ddtree_active = false;
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -2137,35 +2147,100 @@ private:
 
                 const auto & params_spec = slot.task->params.speculative;
 
-                llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+                // DDTree branch: when the knob is on, the ngram-mod drafter is
+                // available, and the target is a hybrid delta-net model, build
+                // a branching verify tree instead of a linear draft. Falls
+                // through to the chain path if any precondition fails or the
+                // ngram drafter has no useful top-K at the current tail.
+                const bool ddtree_ok =
+                    params_spec.ddtree_enable &&
+                    params_spec.ngram_mod &&
+                    slot.verify_cache_enabled &&
+                    llama_model_is_hybrid(model);
 
-                if (draft.size() > (size_t) n_draft_max) {
-                    SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);
-                    draft.resize(n_draft_max);
+                bool built_tree = false;
+                if (ddtree_ok) {
+                    const int ngram_n = (int) params_spec.ngram_mod->get_n();
+                    if ((int) cached_text_tokens.size() + 1 >= ngram_n) {
+                        // Build the n-token tail that keys the ngram: (n-1)
+                        // prior committed tokens + the newly sampled token.
+                        std::vector<int32_t> tail(ngram_n);
+                        const int n_head = ngram_n - 1;
+                        for (int i = 0; i < n_head; i++) {
+                            const int src = (int) cached_text_tokens.size() - n_head + i;
+                            tail[i] = cached_text_tokens[src];
+                        }
+                        tail[n_head] = slot.sampled;
+
+                        common_ddtree tree = common_ddtree_build_from_ngram(
+                            *params_spec.ngram_mod,
+                            tail.data(),
+                            std::min(params_spec.ddtree_budget, n_draft_max),
+                            params_spec.ddtree_alpha,
+                            params_spec.ddtree_temperature);
+
+                        if (tree.n_nodes > 0) {
+                            // Tree root = slot.sampled; attach descriptor so
+                            // the next decode routes through tree kernels.
+                            const int pos_start = slot.prompt.tokens.pos_next();
+                            const int kv_total  = pos_start + 1 + tree.n_nodes;
+                            common_ddtree_set_tree_verify(ctx, tree, pos_start + 1, kv_total, 32);
+
+                            // Add sampled (root) first, then the tree nodes.
+                            slot.i_batch_dft.push_back(batch.n_tokens);
+                            common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
+                            slot.prompt.tokens.push_back(slot.sampled);
+
+                            for (int i = 0; i < tree.n_nodes; i++) {
+                                slot.i_batch_dft.push_back(batch.n_tokens);
+                                common_batch_add(batch, tree.token_ids[i],
+                                                 slot.prompt.tokens.pos_next(), { slot.id }, true);
+                                slot.prompt.tokens.push_back(tree.token_ids[i]);
+                            }
+
+                            slot.n_draft_total += tree.n_nodes;
+                            slot.ddtree        = std::move(tree);
+                            slot.ddtree_active = true;
+                            slot.drafted.clear(); // tree-mode uses slot.ddtree instead
+                            built_tree = true;
+
+                            SLT_DBG(slot, "ddtree: budget=%d -> %d nodes at pos %d\n",
+                                    params_spec.ddtree_budget, slot.ddtree.n_nodes, pos_start + 1);
+                        }
+                    }
                 }
 
-                // add the sampled token to the batch
-                slot.i_batch_dft.push_back(batch.n_tokens);
-                common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
-                slot.prompt.tokens.push_back(slot.sampled);
+                if (!built_tree) {
+                    llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
 
-                if (slot.task->params.speculative.n_min > (int) draft.size()) {
-                    SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
-                    // fallback to normal decoding
-                    slot.i_batch = slot.i_batch_dft[0];
-                    slot.drafted.clear();
-                    slot.i_batch_dft.clear();
-                } else {
-                    // keep track of total number of drafted tokens tested
-                    slot.n_draft_total += draft.size();
-
-                    // add all drafted tokens to the batch
-                    for (size_t i = 0; i < draft.size(); i++) {
-                        slot.i_batch_dft.push_back(batch.n_tokens);
-                        common_batch_add(batch, draft[i], slot.prompt.tokens.pos_next(), { slot.id }, true);
-                        slot.prompt.tokens.push_back(draft[i]);
+                    if (draft.size() > (size_t) n_draft_max) {
+                        SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);
+                        draft.resize(n_draft_max);
                     }
-                    slot.drafted = std::move(draft);
+
+                    // add the sampled token to the batch
+                    slot.i_batch_dft.push_back(batch.n_tokens);
+                    common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
+                    slot.prompt.tokens.push_back(slot.sampled);
+
+                    if (slot.task->params.speculative.n_min > (int) draft.size()) {
+                        SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
+                        // fallback to normal decoding
+                        slot.i_batch = slot.i_batch_dft[0];
+                        slot.drafted.clear();
+                        slot.i_batch_dft.clear();
+                    } else {
+                        // keep track of total number of drafted tokens tested
+                        slot.n_draft_total += draft.size();
+
+                        // add all drafted tokens to the batch
+                        for (size_t i = 0; i < draft.size(); i++) {
+                            slot.i_batch_dft.push_back(batch.n_tokens);
+                            common_batch_add(batch, draft[i], slot.prompt.tokens.pos_next(), { slot.id }, true);
+                            slot.prompt.tokens.push_back(draft[i]);
+                        }
+                        slot.drafted = std::move(draft);
+                    }
                 }
             } else {
                 // no speculative decoding
@@ -2936,12 +3011,53 @@ private:
                     continue;
                 }
 
-                const size_t n_draft = slot.drafted.size();
+                // `n_draft` is the number of draft tokens actually decoded in
+                // the verify forward. In tree mode this is the tree node count
+                // (slot.drafted stays empty), not the linear draft size.
+                const size_t n_draft = slot.ddtree_active
+                    ? (size_t) slot.ddtree.n_nodes
+                    : slot.drafted.size();
 
                 // the accepted tokens from the speculation
-                const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+                llama_tokens ids;
+                if (slot.ddtree_active) {
+                    // Tree mode: walk the tree along target's per-node argmax.
+                    // slot.i_batch_dft layout: [root logits_offset, node_0, node_1, ...]
+                    // Posterior slot 0 = argmax at root position; slots 1..n_nodes = argmax at tree nodes.
+                    int32_t prev_bonus = slot.sampled;
+                    if (!slot.i_batch_dft.empty()) {
+                        const float * root_logits = llama_get_logits_ith(ctx, slot.i_batch_dft[0]);
+                        if (root_logits) {
+                            const llama_model * mdl = llama_get_model(ctx);
+                            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mdl));
+                            int32_t best = 0; float best_lp = root_logits[0];
+                            for (int v = 1; v < n_vocab; ++v) {
+                                if (root_logits[v] > best_lp) { best_lp = root_logits[v]; best = v; }
+                            }
+                            prev_bonus = best;
+                        }
+                    }
+                    const int offset = slot.i_batch_dft.size() > 1 ? slot.i_batch_dft[1] : 0;
+                    auto posterior = common_ddtree_extract_posterior(ctx, slot.ddtree, prev_bonus, offset);
+
+                    int32_t new_bonus = prev_bonus;
+                    auto accepted = common_ddtree_follow_verified(slot.ddtree, posterior.data(), new_bonus);
+
+                    // Translate accepted flat-tree indices to tokens, then append the new bonus.
+                    ids.reserve(accepted.size());
+                    for (size_t i = 1; i < accepted.size(); ++i) {
+                        ids.push_back(slot.ddtree.token_ids[accepted[i] - 1]);
+                    }
+                    ids.push_back(new_bonus);
+
+                    SLT_DBG(slot, "ddtree: %zu/%d accepted, bonus=%d\n",
+                            ids.size() - 1, slot.ddtree.n_nodes, (int) new_bonus);
+                } else {
+                    ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+                }
                 slot.i_batch_dft.clear();
                 slot.drafted.clear();
+                slot.ddtree_active = false;
 
                 const int64_t t_current = ggml_time_us();
 
