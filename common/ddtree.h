@@ -121,3 +121,53 @@ std::vector<int> common_ddtree_follow_verified(
     const common_ddtree & tree,
     const int32_t *       posterior,
     int32_t &             out_next_token);
+
+//
+// Phase 5E — high-level spec-step helpers.
+//
+// These are thin wrappers over the functions above that callers (server,
+// cli, benchmark harnesses) compose into a DDTree spec-decode loop. None
+// of them own batch construction or seq-position bookkeeping — those are
+// caller concerns.
+//
+
+struct llama_context; // fwd — pulled in via <llama.h> at use sites
+
+// Combined ngram-top-K + tree build. Returns an empty-root tree (n_nodes=0)
+// if the drafter has no useful top-K at position 0.
+common_ddtree common_ddtree_build_from_ngram(
+    const common_ngram_mod & ngram,
+    const int32_t *          tail_tokens,   // >= ngram.get_n() entries
+    int                      budget,
+    float                    alpha       = 1.0f,
+    float                    temperature = 0.5f);
+
+// Emit the parent_ids + ancestor-only F16 mask for `tree`, then attach them
+// to `ctx` via llama_set_tree_verify() so that the NEXT llama_decode()
+// routes through the tree kernels. kv_total is the full kv length after
+// the tree's tokens are appended (= prompt_kv_start + tree.n_nodes).
+// kq_mask_pad is usually 32 (standard FA) or 256 (TurboQuant FA); callers
+// pass what matches the backend they configured at context init.
+// No-op if the tree has zero nodes.
+void common_ddtree_set_tree_verify(
+    struct llama_context * ctx,
+    const common_ddtree &  tree,
+    int                    prompt_kv_start,
+    int                    kv_total,
+    int                    kq_mask_pad);
+
+// After llama_decode() runs on the verify batch, extract the argmax posterior
+// for each tree node from the per-position logits. Returns a vector of size
+// tree.n_nodes + 1: slot 0 is prev_bonus (the argmax from the previous
+// round's last decoded position — used as the target's prediction at the
+// root), slots 1..n_nodes are argmaxes at tree positions 0..n_nodes-1.
+//
+// `logits_offset` is the index into llama_get_logits_ith() where this
+// verify batch's first tree logit lives. In the typical single-slot layout
+// where the caller's batch is `[tree_tokens]` with logits=1 on every
+// position, pass 0.
+std::vector<int32_t> common_ddtree_extract_posterior(
+    struct llama_context * ctx,
+    const common_ddtree &  tree,
+    int32_t                prev_bonus,
+    int                    logits_offset = 0);

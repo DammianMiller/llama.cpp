@@ -2,6 +2,8 @@
 
 #include "ngram-mod.h"
 
+#include "llama.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -357,4 +359,89 @@ std::vector<int> common_ddtree_follow_verified(
 
     out_next_token = nxt;
     return accepted;
+}
+
+//
+// Phase 5E — high-level spec-step helpers.
+//
+
+common_ddtree common_ddtree_build_from_ngram(
+        const common_ngram_mod & ngram,
+        const int32_t *          tail_tokens,
+        int                      budget,
+        float                    alpha,
+        float                    temperature) {
+    auto topk = common_draft_topk_from_ngram(ngram, tail_tokens, budget, alpha, temperature);
+    return common_ddtree_build(topk, budget, /*chain_seed=*/ true);
+}
+
+void common_ddtree_set_tree_verify(
+        struct llama_context * ctx,
+        const common_ddtree &  tree,
+        int                    prompt_kv_start,
+        int                    kv_total,
+        int                    kq_mask_pad) {
+    if (ctx == nullptr || tree.n_nodes <= 0) {
+        return;
+    }
+
+    const int n_tokens  = tree.n_nodes;
+
+    // parent_ids[] is the kernel-facing view (root -> -1 sentinel).
+    const std::vector<int32_t> parent_ids = common_ddtree_parent_ids(tree);
+
+    // Mask is q-major [q_pad, kv_pad]; pads computed inside build_mask.
+    const std::vector<uint16_t> mask =
+        common_ddtree_build_mask(tree, prompt_kv_start, kv_total, n_tokens, kq_mask_pad);
+
+    const int kv_pad = ((kv_total + kq_mask_pad - 1) / kq_mask_pad) * kq_mask_pad;
+    const int q_pad  = ((n_tokens + 31) / 32) * 32;
+
+    llama_set_tree_verify(
+        ctx,
+        parent_ids.data(), n_tokens,
+        mask.data(), kv_pad, q_pad);
+}
+
+std::vector<int32_t> common_ddtree_extract_posterior(
+        struct llama_context * ctx,
+        const common_ddtree &  tree,
+        int32_t                prev_bonus,
+        int                    logits_offset) {
+    const int n_nodes = tree.n_nodes;
+    std::vector<int32_t> posterior(n_nodes + 1);
+
+    // Slot 0 = target's prediction AT THE ROOT (= the previous round's bonus
+    // argmax). We don't re-decode the bonus here; the caller supplies it.
+    posterior[0] = prev_bonus;
+
+    if (ctx == nullptr || n_nodes == 0) {
+        return posterior;
+    }
+
+    const llama_model * model   = llama_get_model(ctx);
+    const int           n_vocab = model ? llama_vocab_n_tokens(llama_model_get_vocab(model)) : 0;
+    if (n_vocab <= 0) {
+        return posterior;
+    }
+
+    for (int i = 0; i < n_nodes; ++i) {
+        const float * logits = llama_get_logits_ith(ctx, logits_offset + i);
+        if (logits == nullptr) {
+            posterior[i + 1] = -1;
+            continue;
+        }
+
+        int32_t best_id = 0;
+        float   best_lp = logits[0];
+        for (int v = 1; v < n_vocab; ++v) {
+            if (logits[v] > best_lp) {
+                best_lp = logits[v];
+                best_id = v;
+            }
+        }
+        posterior[i + 1] = best_id;
+    }
+
+    return posterior;
 }
