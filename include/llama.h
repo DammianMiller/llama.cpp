@@ -812,6 +812,37 @@ extern "C" {
                        int n_verify,
                        int commit_n);
 
+    // Attach a DDTree verify descriptor that is consumed by the *next*
+    // llama_decode() call and then cleared. Tells the graph builder to run a
+    // tree-mode verify:
+    //
+    //   parent_ids[t]: 0..n_tokens-1 = flat-tree index of token t's parent.
+    //                  -1            = parent is the pre-block state
+    //                                  (matches GGML_GDN_TREE_ROOT_PARENT
+    //                                  used by ggml_ssm_conv_tree and
+    //                                  ggml_gated_delta_net_ex).
+    //   mask_f16:     ancestor-only attention mask for the full-attn layers,
+    //                 laid out row-major as [mask_q_pad, mask_kv_pad]
+    //                 (q-major — one row per query token). Mask values are
+    //                 F16-bit patterns: 0x0000 = attend, 0xFC00 = -inf.
+    //                 Caller computes and pads per-backend (typically
+    //                 q_pad = 32-aligned, kv_pad = 32 for standard FA paths
+    //                 or 256 for TurboQuant FA paths).
+    //
+    // Only the hybrid delta-net target uses the tree descriptor today.
+    // Ignored on non-hybrid models. Only valid for single-sequence decode.
+    LLAMA_API void llama_set_tree_verify(
+            struct llama_context * ctx,
+            const int32_t *        parent_ids,
+            int                    n_tokens,
+            const uint16_t *       mask_f16,
+            int                    mask_kv_pad,
+            int                    mask_q_pad);
+
+    // Explicit clear; normally not needed — llama_decode() clears it after
+    // consuming. Exposed for error-recovery paths.
+    LLAMA_API void llama_clear_tree_verify(struct llama_context * ctx);
+
     //
     // State / sessions
     //

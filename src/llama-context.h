@@ -234,6 +234,21 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // One-shot DDTree verify descriptor, consumed by the next decode.
+    // When `pending` is true, the graph builder routes ssm_conv →
+    // ssm_conv_tree and passes parent_ids + ancestor-only mask into
+    // gated_delta_net_ex / the full-attn mask input. Cleared at the end of
+    // llama_decode regardless of success. Set via llama_set_tree_verify().
+    struct tree_verify_state {
+        bool                  pending        = false;
+        int                   n_tokens       = 0;
+        int                   mask_kv_pad    = 0;
+        int                   mask_q_pad     = 0;
+        std::vector<int32_t>  parent_ids;    // [n_tokens]
+        std::vector<uint16_t> mask_f16;      // [mask_kv_pad * mask_q_pad]
+    };
+    tree_verify_state tree_verify;
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,

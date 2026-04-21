@@ -3349,6 +3349,38 @@ void llama_memory_rollback_to_verify_slot(
     }
 }
 
+void llama_set_tree_verify(
+        struct llama_context * ctx,
+        const int32_t *        parent_ids,
+        int                    n_tokens,
+        const uint16_t *       mask_f16,
+        int                    mask_kv_pad,
+        int                    mask_q_pad) {
+    if (!ctx) {
+        return;
+    }
+    if (!parent_ids || n_tokens <= 0 || !mask_f16 || mask_kv_pad <= 0 || mask_q_pad <= 0) {
+        // Invalid descriptor — clear any stale pending state and bail.
+        ctx->tree_verify = llama_context::tree_verify_state{};
+        return;
+    }
+
+    auto & s = ctx->tree_verify;
+    s.pending     = true;
+    s.n_tokens    = n_tokens;
+    s.mask_kv_pad = mask_kv_pad;
+    s.mask_q_pad  = mask_q_pad;
+    s.parent_ids.assign(parent_ids, parent_ids + n_tokens);
+    s.mask_f16.assign(mask_f16, mask_f16 + (size_t) mask_kv_pad * mask_q_pad);
+}
+
+void llama_clear_tree_verify(struct llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->tree_verify = llama_context::tree_verify_state{};
+}
+
 // llama state API
 
 // deprecated
@@ -3486,6 +3518,14 @@ int32_t llama_decode(
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    }
+
+    // One-shot tree verify descriptor: clear after every decode so a stale
+    // tree from a previous step can't leak into the next forward. Callers
+    // that want consecutive tree-verify decodes must call
+    // llama_set_tree_verify() again before each one.
+    if (ctx) {
+        ctx->tree_verify = llama_context::tree_verify_state{};
     }
 
     return ret;
