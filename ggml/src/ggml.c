@@ -6210,16 +6210,9 @@ struct ggml_tensor * ggml_gated_delta_net(
 
     GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
 
-    // Pack output, final new_state, and per-step intermediate states into one tensor.
-    // Layout (in units of `S_v * H`-wide rows):
-    //   [ attn_output: n_tokens*n_seqs | final_state: S_v*n_seqs | intermediate_states: S_v*n_tokens*n_seqs ]
-    //
-    // The final_state slot is kept for backward compatibility with stock llama.cpp
-    // callers that read state at offset S_v*H*n_tokens*n_seqs. The intermediate_states
-    // region is a dflash extension: for each token t in [0, n_tokens), it holds the
-    // recurrent state after processing token t. Used by the spec decoding loop to
-    // roll back SSM state to the accepted prefix without a full replay forward pass.
-    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs + S_v * n_tokens * n_seqs, 1, 1 };
+    // concat output and new_state into a single tensor
+    // output: S_v * H * n_tokens * n_seqs, state: S_v * S_v * H * n_seqs
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
@@ -6233,37 +6226,10 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
-// dflash: tree-mode variant. Same op, with parent_ids plumbed into
-// src[6] so the CUDA kernel can branch-reload state at DFS transitions.
-struct ggml_tensor * ggml_gated_delta_net_tree(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * q,
-        struct ggml_tensor  * k,
-        struct ggml_tensor  * v,
-        struct ggml_tensor  * g,
-        struct ggml_tensor  * beta,
-        struct ggml_tensor  * state,
-        struct ggml_tensor  * parent_ids) {
-    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
-
-    GGML_ASSERT(parent_ids != NULL);
-    GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(parent_ids));
-
-    const int64_t n_tokens = v->ne[2];
-    const int64_t n_seqs   = v->ne[3];
-    GGML_ASSERT(ggml_nelements(parent_ids) == n_tokens * n_seqs);
-
-    result->src[6] = parent_ids;
-
-    return result;
-}
-
-// dflash: tree-mode + external persistent intermediate buffer. The
-// kernel writes per-token intermediate states DIRECTLY into persist_inter's
-// memory, skipping the cost of copying them out of the result tensor's
-// internal region after graph_compute.
-struct ggml_tensor * ggml_gated_delta_net_tree_persist(
+// dflash: unified entry point with optional tree-mode (parent_ids) and
+// optional external persistent intermediate-state buffer (persist_inter).
+// See ggml.h::ggml_gated_delta_net_ex for the invariants.
+struct ggml_tensor * ggml_gated_delta_net_ex(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -6273,21 +6239,31 @@ struct ggml_tensor * ggml_gated_delta_net_tree_persist(
         struct ggml_tensor  * state,
         struct ggml_tensor  * parent_ids,
         struct ggml_tensor  * persist_inter) {
-    struct ggml_tensor * result = ggml_gated_delta_net_tree(
-        ctx, q, k, v, g, beta, state, parent_ids);
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
 
-    GGML_ASSERT(persist_inter != NULL);
-    GGML_ASSERT(persist_inter->type == GGML_TYPE_F32 ||
-                persist_inter->type == GGML_TYPE_F16);
-    GGML_ASSERT(ggml_is_contiguous(persist_inter));
+    // Tree mode requires a persistent intermediate buffer — the branch-reload
+    // path reads historical recurrent states from there.
+    GGML_ASSERT(parent_ids == NULL || persist_inter != NULL);
 
     const int64_t S_v      = v->ne[0];
     const int64_t H        = v->ne[1];
     const int64_t n_tokens = v->ne[2];
     const int64_t n_seqs   = v->ne[3];
-    GGML_ASSERT(ggml_nelements(persist_inter) >= S_v * S_v * H * n_tokens * n_seqs);
 
-    result->src[7] = persist_inter;
+    if (parent_ids != NULL) {
+        GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(parent_ids));
+        GGML_ASSERT(ggml_nelements(parent_ids) == n_tokens * n_seqs);
+        result->src[6] = parent_ids;
+    }
+
+    if (persist_inter != NULL) {
+        GGML_ASSERT(persist_inter->type == GGML_TYPE_F32 ||
+                    persist_inter->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(persist_inter));
+        GGML_ASSERT(ggml_nelements(persist_inter) >= S_v * S_v * H * n_tokens * n_seqs);
+        result->src[7] = persist_inter;
+    }
 
     return result;
 }

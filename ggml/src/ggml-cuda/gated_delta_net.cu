@@ -60,31 +60,23 @@ gated_delta_net_cuda(const float * q,
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
 
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
-    const int64_t final_state_elems = S_v * S_v * H * n_seqs;
     float *       attn_data        = dst;
     float *       state            = dst + attn_score_elems;
-    // intermediate_states region: one S_v*S_v*H*n_seqs state per token. Written
-    // inside the token loop below (one state per `t`) to enable spec-decode
-    // rollback without a replay forward pass. See ggml.c::ggml_gated_delta_net.
-    //
-    // dflash27b_ggml: if persist_inter != nullptr, the kernel writes the
-    // intermediate states DIRECTLY to that external buffer instead of the
-    // embedded region inside dst. InterT selects the storage precision (float
-    // or __half). f16 halves the memory footprint — enough to fit larger
-    // DDtree budgets on the 24 GB 3090.
-    // When persist_inter is null, InterT MUST be float (the embedded region
-    // inside dst is f32).
-    InterT * inter_states = persist_inter
-        ? persist_inter
-        : (InterT *)(dst + attn_score_elems + final_state_elems);
+    // Intermediate-state capture is opt-in via an external persist buffer.
+    // When persist_inter is nullptr the kernel does not write per-token states
+    // and the tensor shape matches stock ggml_gated_delta_net. Tree mode
+    // requires persist_inter != nullptr (asserted at dispatch).
+    InterT * inter_states = persist_inter;
 
     const int64_t state_offset = (sequence * H + h_idx) * S_v * S_v;
     state += state_offset;
     curr_state += state_offset + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
     // Per-sequence per-head base for this block's intermediates, token t=0.
-    // Advance by (H * S_v * S_v) each iteration.
-    InterT * inter_base = inter_states + (sequence * n_tokens * H + h_idx) * S_v * S_v;
+    // Advance by (H * S_v * S_v) each iteration. Null when persist disabled.
+    InterT * inter_base = inter_states
+        ? inter_states + (sequence * n_tokens * H + h_idx) * S_v * S_v
+        : nullptr;
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
@@ -222,15 +214,18 @@ gated_delta_net_cuda(const float * q,
             }
         }
 
-        // Write the intermediate state for token t (same transposed layout as the
-        // final-state write below). Used by dflash27b_ggml spec-decode rollback.
+        // Opt-in intermediate-state write for token t (same transposed layout
+        // as the final-state write below). Used by spec-decode rollback and
+        // by the TREE_MODE branch-reload path on subsequent tokens.
         // store_inter_state converts float → InterT (f32 passthrough or __float2half).
+        if (inter_base != nullptr) {
 #pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i = r * warp_size + lane;
-            store_inter_state(inter_base, col * S_v + i, s_shard[r]);
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                store_inter_state(inter_base, col * S_v + i, s_shard[r]);
+            }
+            inter_base += S_v * S_v * H;
         }
-        inter_base += S_v * S_v * H;
 
         attn_data += S_v * H;
     }
@@ -370,6 +365,9 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
         GGML_ASSERT(src_parent->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_is_contiguous(src_parent));
         GGML_ASSERT(ggml_nelements(src_parent) == n_tokens * n_seqs);
+        // Tree mode reads historical states from the persist buffer at branch
+        // points, so the caller must have supplied one.
+        GGML_ASSERT(src_persist_inter != NULL);
     }
 
     // strides in floats (beta strides used for both g and beta offset computation)

@@ -2499,33 +2499,26 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
 
-    // dflash extension: tree-mode gated delta net for DDTree-style
-    // speculative decoding verify. `parent_ids` is an int32 tensor of shape
-    // [n_tokens, n_seqs] where entry [t, s] is the index within sequence s of
-    // the parent token in the DFS-flattened tree (or -1 for a root-level
-    // node). At each token step t > 0 in the recurrence, if parent_ids[t] is
-    // not (t - 1), the kernel reloads the recurrent state from the
-    // intermediate-states region at parent_ids[t] instead of continuing
-    // sequentially. This lets one verify forward pass correctly process
-    // multiple tree branches (siblings) without cross-contamination.
-    GGML_API struct ggml_tensor * ggml_gated_delta_net_tree(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * q,
-            struct ggml_tensor  * k,
-            struct ggml_tensor  * v,
-            struct ggml_tensor  * g,
-            struct ggml_tensor  * beta,
-            struct ggml_tensor  * state,
-            struct ggml_tensor  * parent_ids);
-
-    // dflash extension: tree-mode with direct intermediate-state writes to a
-    // persistent external buffer. Identical to ggml_gated_delta_net_tree but
-    // the per-token intermediate states are written to `persist_inter->data`
-    // (f32 or f16, [S_v, S_v, H, n_tokens, n_seqs], contiguous) instead of
-    // the default internal region of the result tensor. Eliminates a
-    // downstream ggml_cpy into the persistent cache buffer, saving ~5-10 ms
-    // per verify step on a 27B hybrid target.
-    GGML_API struct ggml_tensor * ggml_gated_delta_net_tree_persist(
+    // dflash extension: gated delta net with optional tree-mode recurrence and
+    // optional external buffer for per-token intermediate recurrent states.
+    //
+    //   parent_ids    (nullable): int32 tensor [n_tokens, n_seqs]. Entry [t, s]
+    //     is the index within sequence s of token t's parent in the
+    //     DFS-flattened tree, or -1 if t is a root-level sibling (whose parent
+    //     is the pre-block state). When non-NULL, the kernel reloads the
+    //     recurrent state from persist_inter[parent_ids[t]] at branch points
+    //     (parent_t != t - 1), letting one forward pass verify a DDTree-style
+    //     tree without cross-contamination across siblings.
+    //
+    //   persist_inter (nullable): f32 or f16 contiguous buffer of shape
+    //     [S_v, S_v, H, n_tokens, n_seqs]. When non-NULL, the kernel writes the
+    //     per-token intermediate recurrent state directly into it, skipping a
+    //     downstream ggml_cpy into the spec-decode rollback cache.
+    //
+    // Constraint: parent_ids != NULL requires persist_inter != NULL (the tree
+    // branch-reload path needs somewhere to read historical states from). Both
+    // NULL is legal and is equivalent to ggml_gated_delta_net.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ex(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
             struct ggml_tensor  * k,
