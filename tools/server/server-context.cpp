@@ -2169,10 +2169,21 @@ private:
 
                 const bool ddtree_enable =
                     params_spec.ddtree_enable || params_base.speculative.ddtree_enable;
+
+                // DDTree requires a homogeneous verify batch. Multi-slot
+                // parallel decode mixes prompt-processing tokens into the
+                // same batch as the spec step, which would desync the
+                // per-token parent_ids array with the actual batch layout
+                // and trip the kernel's `ggml_nelements(parent_ids) ==
+                // n_tokens * n_seqs` assertion. Fall back to chain spec
+                // whenever the context is multi-parallel.
+                const bool single_slot_ctx = params_base.n_parallel <= 1;
+
                 const bool ddtree_ok =
                     ddtree_enable &&
                     ngram_src &&
                     slot.verify_cache_enabled &&
+                    single_slot_ctx &&
                     llama_model_is_hybrid(model);
 
                 bool built_tree = false;
