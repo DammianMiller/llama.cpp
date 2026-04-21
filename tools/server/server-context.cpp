@@ -810,13 +810,15 @@ private:
 
                     // For hybrid (delta-net) target models, enable the persist
                     // verify cache so we can roll back after a verify forward
-                    // without replay. Size = n_max (chain upper bound) or the
-                    // DDTree budget if that's larger, plus 1 for the tree root
-                    // slot (which re-decodes the previous-round bonus).
-                    if (llama_model_is_hybrid(model)) {
+                    // without replay. Gated on --spec-ddtree because the
+                    // chain-mode rollback path interacts poorly with the
+                    // server's prompt-cache reuse logic (subsequent requests
+                    // force full prompt re-processing); the tree path is the
+                    // only consumer today and avoids that reuse. Size =
+                    // max(n_max, ddtree_budget) + 1 to cover the verify root.
+                    if (llama_model_is_hybrid(model) && params_base.speculative.ddtree_enable) {
                         const int n_max = params_base.speculative.n_max;
-                        const int ddbudget = params_base.speculative.ddtree_enable
-                            ? params_base.speculative.ddtree_budget : 0;
+                        const int ddbudget = params_base.speculative.ddtree_budget;
                         const int max_verify = std::max(n_max, ddbudget) + 1;
                         if (max_verify > 1) {
                             const bool ok = llama_memory_enable_verify_cache(
@@ -3119,20 +3121,26 @@ private:
                 const int commit_n = (int)ids.size() - 1;
 
                 // Verify batch size + slot index for the persist-buffer read.
-                // Chain mode: batch = n_draft linear drafts, slot commit_n-1.
-                // Tree mode:  batch = 1 (root) + n_nodes, slot includes root so
-                //             the slot index = 1 + accepted_drafts = 1 + commit_n.
-                // rollback_to_verify_slot(n_verify, N) reads persist[N-1], so
-                // pass N = 1 + commit_n for tree mode, N = commit_n for chain.
-                const int rb_n_verify = was_tree
-                    ? (int) (1 + n_draft)   // 1 (root) + n_nodes
-                    : (int) n_draft;
-                const int rb_commit_n = was_tree
-                    ? (1 + commit_n)
-                    : commit_n;
+                // In BOTH modes the verify batch includes a re-decoded seed
+                // token (chain: slot.sampled at batch pos 0, tree: the tree
+                // root at batch pos 0). So:
+                //   n_verify = 1 + n_draft   (batch size)
+                //   commit_n = 1 + accepted  (accepted positions from batch 0)
+                // rollback_to_verify_slot reads persist[commit_n-1] and
+                // adjusts cell.pos by -(n_verify - commit_n).
+                const int rb_n_verify = (int) (1 + n_draft);
+                const int rb_commit_n = 1 + commit_n;
 
+                // Only tree mode uses the persist-buffer rollback. Chain spec
+                // sticks with the existing seq_rm + activation-replay path
+                // because the server's prompt-cache reuse logic currently
+                // treats the persist-buffer rolled state as "cold", forcing
+                // full prefills on subsequent requests (measured: chain+cache
+                // drops 2nd-request tok/s by 10-20x). Tree mode doesn't hit
+                // that path because it always builds a fresh verify batch.
                 const bool used_verify_rollback =
-                    slot.verify_cache_enabled && commit_n > 0 && llama_model_is_hybrid(llama_get_model(ctx));
+                    was_tree && slot.verify_cache_enabled && commit_n > 0
+                    && llama_model_is_hybrid(llama_get_model(ctx));
 
                 if (used_verify_rollback) {
                     llama_memory_rollback_to_verify_slot(

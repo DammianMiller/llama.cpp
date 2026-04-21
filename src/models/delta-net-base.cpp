@@ -392,6 +392,14 @@ ggml_tensor * llm_build_delta_net_base::build_gated_delta_net(
 }
 
 void llm_build_delta_net_base::build_persist_conv_input(ggml_cgraph * gf, int il, ggml_tensor * conv_input) {
+    // Only write the conv_input_cache when this forward is a DDTree verify.
+    // Chain spec uses the seq_rm + activation-replay path and doesn't read
+    // from the persist buffer; attaching the ggml_cpy here just adds
+    // per-step kernel-launch overhead and interferes with the server's
+    // prompt-cache reuse logic on subsequent requests.
+    if (!tree_verify_pending) {
+        return;
+    }
     ggml_tensor * conv_cache = nullptr;
     if (const auto * hctx = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
         conv_cache = hctx->get_conv_input_cache(il);
@@ -404,9 +412,12 @@ void llm_build_delta_net_base::build_persist_conv_input(ggml_cgraph * gf, int il
     // conv_input_cache shape:  [(d_conv-1) + max_verify_tokens, conv_channels]  (n_seqs=1 assumed)
     //
     // The cache is sized for verify-sized batches only. Skip persistence on
-    // prompt-prefill batches (live_window > cache capacity) and on any
-    // batch with n_seqs > 1 — those can't be meaningfully rolled back via
-    // the persist path anyway. The chain-mode rollback fallback covers them.
+    // single-token decode (rollback is trivial), on prompt-prefill batches
+    // (live_window > cache capacity), and on any batch with n_seqs > 1. The
+    // chain-mode rollback fallback covers any case we skip here.
+    if (n_tokens <= 1) {
+        return; // single-token decode — no draft to roll back, persist is wasted work
+    }
     const int64_t live_window   = conv_input->ne[0];
     const int64_t conv_channels = conv_input->ne[1];
     if (conv_input->ne[2] != 1) {
@@ -468,21 +479,25 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     // stays nullptr and build_gated_delta_net falls back to the exact
     // chain-mode ggml path.
     ggml_tensor * persist_inter = nullptr;
-    if (const auto * hctx = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
-        ggml_tensor * cand = hctx->get_ssm_intermediate(il);
-        if (cand != nullptr) {
-            // ssm_intermediate shape: [S_v*S_v, H, max_verify_tokens, n_seqs].
-            // Skip persist when the live batch exceeds max_verify_tokens
-            // (prompt prefill) or spans >1 seq (the persist path is
-            // single-seq only for now).
-            const int64_t max_verify_tokens = cand->ne[2];
-            if (n_tokens <= max_verify_tokens && n_seqs == 1) {
-                persist_inter = cand;
+    if (tree_verify_pending) {
+        if (const auto * hctx = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+            ggml_tensor * cand = hctx->get_ssm_intermediate(il);
+            if (cand != nullptr) {
+                // ssm_intermediate shape: [S_v*S_v, H, max_verify_tokens, n_seqs].
+                // Only attach when this forward is the DDTree verify for which
+                // the caller set up a tree descriptor. Chain spec sticks with
+                // the seq_rm + activation-replay rollback path (the cheaper
+                // path once we measured — the persist writeback was adding
+                // per-step ggml_cpy overhead that penalised chain spec).
+                const int64_t max_verify_tokens = cand->ne[2];
+                if (n_tokens > 1 && n_tokens <= max_verify_tokens && n_seqs == 1) {
+                    persist_inter = cand;
+                }
             }
+        } else if (const auto * hictx = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
+            // iswa hybrid is used by non-delta-net models today; guard anyway.
+            (void) hictx;
         }
-    } else if (const auto * hictx = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
-        // iswa hybrid is used by non-delta-net models today; guard anyway.
-        (void) hictx;
     }
 
     // DDTree verify (Phase 5): when a tree-verify descriptor is pending on
