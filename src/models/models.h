@@ -55,6 +55,22 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                         int   il);
 
+    // Thin wrapper over ggml_gated_delta_net_ex. parent_ids and persist_inter
+    // are optional: passing both NULL is exactly equivalent to the plain
+    // chain-mode ggml_gated_delta_net call. When persist_inter is non-NULL,
+    // the kernel writes its per-token intermediate recurrent states into it
+    // so spec-decode rollback can avoid a replay forward pass.
+    ggml_tensor * build_gated_delta_net(
+                int           il,
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * s,
+                ggml_tensor * parent_ids    = nullptr,
+                ggml_tensor * persist_inter = nullptr);
+
     // choose one of two implementations above based on the number of tokens
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
                 ggml_tensor * q,

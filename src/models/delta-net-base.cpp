@@ -369,6 +369,26 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     return {o, s};
 }
 
+ggml_tensor * llm_build_delta_net_base::build_gated_delta_net(
+        int           il,
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * g,
+        ggml_tensor * b,
+        ggml_tensor * s,
+        ggml_tensor * parent_ids,
+        ggml_tensor * persist_inter) {
+    ggml_tensor * result = ggml_gated_delta_net_ex(ctx0, q, k, v, g, b, s, parent_ids, persist_inter);
+    const int64_t n_tokens = q->ne[2];
+    if (n_tokens == 1) {
+        cb(result, LLAMA_TENSOR_NAME_FGDN_AR, il);
+    } else {
+        cb(result, LLAMA_TENSOR_NAME_FGDN_CH, il);
+    }
+    return result;
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_fused(
         ggml_tensor * q,
         ggml_tensor * k,
