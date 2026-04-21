@@ -59,6 +59,8 @@ add_library(${TARGET} STATIC
     common.h
     console.cpp
     console.h
+    ddtree.cpp
+    ddtree.h
     debug.cpp
     debug.h
     download.cpp
