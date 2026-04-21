@@ -1,6 +1,8 @@
 #include "models.h"
 
 #include "llama-impl.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
@@ -417,12 +419,20 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
-    if (n_tokens == 1) {
-        cb(result, LLAMA_TENSOR_NAME_FGDN_AR, il);
-    } else {
-        cb(result, LLAMA_TENSOR_NAME_FGDN_CH, il);
+    // Attach the hybrid memory's verify-cache persist tensor for this layer, if
+    // enabled. When the feature is off (the default) this stays nullptr and
+    // build_gated_delta_net falls back to the exact chain-mode ggml path.
+    ggml_tensor * persist_inter = nullptr;
+    if (const auto * hctx = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+        persist_inter = hctx->get_ssm_intermediate(il);
+    } else if (const auto * hictx = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
+        // iswa hybrid is used by non-delta-net models today; guard anyway.
+        (void) hictx;
     }
+
+    // Phase 2: chain mode only — parent_ids stays nullptr. Phase 5 will pass
+    // a DDTree parent_ids tensor through the same helper.
+    ggml_tensor * result = build_gated_delta_net(il, q, k, v, g, b, s, /*parent_ids=*/nullptr, persist_inter);
 
     ggml_tensor * output = ggml_view_4d(ctx0, result,
             S_v, H_v, n_tokens, n_seqs,
