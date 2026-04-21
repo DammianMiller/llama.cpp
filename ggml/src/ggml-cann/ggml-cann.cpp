@@ -2648,6 +2648,8 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 return true;
             }
         case GGML_OP_SSM_CONV:
+            // dflash tree-mode (src[2] = parent_ids) not implemented; fall back to CPU.
+            if (op->src[2] != nullptr) return false;
             return true;
         default:
             return false;

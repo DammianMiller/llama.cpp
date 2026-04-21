@@ -1161,12 +1161,19 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_SSM_CONV:
+            // dflash tree-mode (src[2] = parent_ids) is not implemented here;
+            // let the scheduler fall back to CPU.
+            if (op->src[2] != NULL) return false;
+            return has_simdgroup_reduction;
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
+            // dflash extensions (src[6] = parent_ids, src[7] = persist_inter)
+            // are not implemented here; fall back to CPU.
+            if (op->src[6] != NULL || op->src[7] != NULL) return false;
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:

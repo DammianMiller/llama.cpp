@@ -3902,10 +3902,18 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             supports_op = op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
             break;
         case GGML_OP_SSM_CONV:
+            // dflash tree-mode (src[2] = parent_ids) not implemented; fall back to CPU.
+            if (op->src[2] != nullptr) { supports_op = false; break; }
             supports_op = op->type == GGML_TYPE_F32;
             break;
         case GGML_OP_GATED_DELTA_NET:
             {
+                // dflash extensions (src[6] = parent_ids, src[7] = persist_inter)
+                // not implemented; fall back to CPU.
+                if (op->src[6] != nullptr || op->src[7] != nullptr) {
+                    supports_op = false;
+                    break;
+                }
                 const uint32_t s_v = (uint32_t) src2->ne[0];
                 supports_op = op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                               src2->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
