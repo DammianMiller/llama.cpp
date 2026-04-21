@@ -385,10 +385,17 @@ void common_ddtree_set_tree_verify(
         return;
     }
 
-    const int n_tokens  = tree.n_nodes;
+    // The verify batch is `1 + tree.n_nodes` tokens: slot 0 is the root
+    // (the previously-committed bonus being re-decoded for its logits),
+    // slots 1..n_nodes are the new tree tokens. The per-token parent_ids
+    // array must mirror that layout — root gets -1 (pre-block state), the
+    // rest come from the tree.
+    const int n_tokens = 1 + tree.n_nodes;
 
-    // parent_ids[] is the kernel-facing view (root -> -1 sentinel).
-    const std::vector<int32_t> parent_ids = common_ddtree_parent_ids(tree);
+    std::vector<int32_t> parent_ids(n_tokens);
+    parent_ids[0] = -1;  // root maps to the pre-block sentinel
+    const auto node_parents = common_ddtree_parent_ids(tree);
+    std::copy(node_parents.begin(), node_parents.end(), parent_ids.begin() + 1);
 
     // Mask is q-major [q_pad, kv_pad]; pads computed inside build_mask.
     const std::vector<uint16_t> mask =

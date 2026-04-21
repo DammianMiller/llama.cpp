@@ -2192,9 +2192,16 @@ ggml_tensor * llm_graph_context::build_attn(
     // DDTree verify: override the default causal mask with the ancestor-only
     // mask supplied via llama_set_tree_verify(). The ancestor-only mask
     // spans the full [kv_pad, q_pad] of the verify batch and is already F16.
+    // The original kq_mask tensor would otherwise be orphaned once we stop
+    // referencing it from flash_attn_ext, which makes the scheduler skip
+    // buffer allocation and explodes inside set_input_kq_mask. Keep it
+    // alive by attaching a 1-element view to the forward graph — a no-op
+    // on output but enough to pin the buffer.
     if (tree_verify_pending) {
         const auto tv = build_inp_tree_verify();
         if (tv.second != nullptr) {
+            ggml_tensor * pin = ggml_view_1d(ctx0, kq_mask, 1, 0);
+            ggml_build_forward_expand(gf, pin);
             kq_mask = tv.second;
         }
     }

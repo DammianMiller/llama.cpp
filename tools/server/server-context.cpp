@@ -810,11 +810,15 @@ private:
 
                     // For hybrid (delta-net) target models, enable the persist
                     // verify cache so we can roll back after a verify forward
-                    // without replay. n_max is the largest verify length the
-                    // spec path will run — chain uses up to n_max drafts.
+                    // without replay. Size = n_max (chain upper bound) or the
+                    // DDTree budget if that's larger, plus 1 for the tree root
+                    // slot (which re-decodes the previous-round bonus).
                     if (llama_model_is_hybrid(model)) {
-                        const int max_verify = params_base.speculative.n_max;
-                        if (max_verify > 0) {
+                        const int n_max = params_base.speculative.n_max;
+                        const int ddbudget = params_base.speculative.ddtree_enable
+                            ? params_base.speculative.ddtree_budget : 0;
+                        const int max_verify = std::max(n_max, ddbudget) + 1;
+                        if (max_verify > 1) {
                             const bool ok = llama_memory_enable_verify_cache(
                                 llama_get_memory(slot.ctx),
                                 max_verify,
@@ -2152,15 +2156,26 @@ private:
                 // a branching verify tree instead of a linear draft. Falls
                 // through to the chain path if any precondition fails or the
                 // ngram drafter has no useful top-K at the current tail.
+                //
+                // The ngram_mod shared_ptr is initialised onto params_base
+                // (not the per-task copy) by common_speculative_init; prefer
+                // the base instance so we don't race with the task copy.
+                const auto & ngram_src =
+                    params_base.speculative.ngram_mod
+                        ? params_base.speculative.ngram_mod
+                        : params_spec.ngram_mod;
+
+                const bool ddtree_enable =
+                    params_spec.ddtree_enable || params_base.speculative.ddtree_enable;
                 const bool ddtree_ok =
-                    params_spec.ddtree_enable &&
-                    params_spec.ngram_mod &&
+                    ddtree_enable &&
+                    ngram_src &&
                     slot.verify_cache_enabled &&
                     llama_model_is_hybrid(model);
 
                 bool built_tree = false;
                 if (ddtree_ok) {
-                    const int ngram_n = (int) params_spec.ngram_mod->get_n();
+                    const int ngram_n = (int) ngram_src->get_n();
                     if ((int) cached_text_tokens.size() + 1 >= ngram_n) {
                         // Build the n-token tail that keys the ngram: (n-1)
                         // prior committed tokens + the newly sampled token.
@@ -2173,18 +2188,21 @@ private:
                         tail[n_head] = slot.sampled;
 
                         common_ddtree tree = common_ddtree_build_from_ngram(
-                            *params_spec.ngram_mod,
+                            *ngram_src,
                             tail.data(),
                             std::min(params_spec.ddtree_budget, n_draft_max),
                             params_spec.ddtree_alpha,
                             params_spec.ddtree_temperature);
 
                         if (tree.n_nodes > 0) {
-                            // Tree root = slot.sampled; attach descriptor so
-                            // the next decode routes through tree kernels.
+                            // Tree root = slot.sampled (not yet in cache); the
+                            // 1 + tree.n_nodes new tokens occupy positions
+                            // [pos_start .. pos_start + 1 + n_nodes). The mask's
+                            // "block" starts at pos_start so visibility[0][0]=1
+                            // makes the root attend to itself.
                             const int pos_start = slot.prompt.tokens.pos_next();
                             const int kv_total  = pos_start + 1 + tree.n_nodes;
-                            common_ddtree_set_tree_verify(ctx, tree, pos_start + 1, kv_total, 32);
+                            common_ddtree_set_tree_verify(ctx, tree, pos_start, kv_total, 32);
 
                             // Add sampled (root) first, then the tree nodes.
                             slot.i_batch_dft.push_back(batch.n_tokens);
@@ -3011,16 +3029,24 @@ private:
                     continue;
                 }
 
-                // `n_draft` is the number of draft tokens actually decoded in
-                // the verify forward. In tree mode this is the tree node count
-                // (slot.drafted stays empty), not the linear draft size.
-                const size_t n_draft = slot.ddtree_active
+                // Capture the tree-mode flag locally — we clear the slot's
+                // active flag below once the tree state has been consumed, but
+                // several downstream branches still need to know that this
+                // particular accept step ran under tree mode.
+                const bool was_tree = slot.ddtree_active;
+
+                // `n_draft` — the number of prompt entries appended purely by
+                // drafting in this step, which will be rolled back by
+                // keep_first below. Chain mode: the linear draft length. Tree
+                // mode: n_nodes new tokens (the root/sampled is NOT a draft —
+                // it was committed from the previous round).
+                const size_t n_draft = was_tree
                     ? (size_t) slot.ddtree.n_nodes
                     : slot.drafted.size();
 
                 // the accepted tokens from the speculation
                 llama_tokens ids;
-                if (slot.ddtree_active) {
+                if (was_tree) {
                     // Tree mode: walk the tree along target's per-node argmax.
                     // slot.i_batch_dft layout: [root logits_offset, node_0, node_1, ...]
                     // Posterior slot 0 = argmax at root position; slots 1..n_nodes = argmax at tree nodes.
@@ -3068,8 +3094,12 @@ private:
                 // update how many tokens out of those tested were accepted
                 slot.n_draft_accepted += ids.size() - 1;
 
-                // inform the speculative decoding about the number of accepted tokens
-                common_speculative_accept(slot.spec, ids.size() - 1);
+                // inform the speculative decoding about the number of accepted tokens.
+                // Tree mode bypasses common_speculative_draft, so spec->curr_impl
+                // is never set and common_speculative_accept would assert.
+                if (!was_tree) {
+                    common_speculative_accept(slot.spec, ids.size() - 1);
+                }
 
                 // rollback to the state before sampling the draft tokens
                 slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
@@ -3087,14 +3117,28 @@ private:
                 // pre-verify snapshot, which we don't hold), or (c) the target
                 // is not a hybrid model.
                 const int commit_n = (int)ids.size() - 1;
+
+                // Verify batch size + slot index for the persist-buffer read.
+                // Chain mode: batch = n_draft linear drafts, slot commit_n-1.
+                // Tree mode:  batch = 1 (root) + n_nodes, slot includes root so
+                //             the slot index = 1 + accepted_drafts = 1 + commit_n.
+                // rollback_to_verify_slot(n_verify, N) reads persist[N-1], so
+                // pass N = 1 + commit_n for tree mode, N = commit_n for chain.
+                const int rb_n_verify = was_tree
+                    ? (int) (1 + n_draft)   // 1 (root) + n_nodes
+                    : (int) n_draft;
+                const int rb_commit_n = was_tree
+                    ? (1 + commit_n)
+                    : commit_n;
+
                 const bool used_verify_rollback =
                     slot.verify_cache_enabled && commit_n > 0 && llama_model_is_hybrid(llama_get_model(ctx));
 
                 if (used_verify_rollback) {
                     llama_memory_rollback_to_verify_slot(
                         llama_get_memory(ctx), slot.id,
-                        /*n_verify=*/ (int)n_draft,
-                        /*commit_n=*/ commit_n);
+                        /*n_verify=*/ rb_n_verify,
+                        /*commit_n=*/ rb_commit_n);
                 } else {
                     llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
                 }
