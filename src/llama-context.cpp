@@ -6,6 +6,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3315,6 +3316,36 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+bool llama_memory_enable_verify_cache(llama_memory_t mem, int max_verify_tokens, enum ggml_type persist_type) {
+    if (!mem) {
+        return false;
+    }
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (!hybrid) {
+        LLAMA_LOG_WARN("%s: memory is not a hybrid cache; verify cache not enabled\n", __func__);
+        return false;
+    }
+    return hybrid->enable_verify_cache(max_verify_tokens, persist_type);
+}
+
+void llama_memory_disable_verify_cache(llama_memory_t mem) {
+    if (!mem) {
+        return;
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        hybrid->disable_verify_cache();
+    }
+}
+
+void llama_memory_rollback_to_verify_slot(llama_memory_t mem, llama_seq_id seq_id, int commit_n) {
+    if (!mem) {
+        return;
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        hybrid->rollback_to_verify_slot(seq_id, commit_n);
+    }
 }
 
 // llama state API

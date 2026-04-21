@@ -781,6 +781,30 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Configure a persistent intermediate-state buffer in the hybrid memory so
+    // speculative decoding can roll back without re-running the accepted prefix.
+    // max_verify_tokens is the largest n_tokens passed to llama_decode during a
+    // verify step (typically DDTree budget + 1 or chain spec n_spec + 1).
+    // persist_type must be GGML_TYPE_F32 or GGML_TYPE_F16 (F16 halves memory).
+    // No-op if the model is not a hybrid delta-net model. Returns false on
+    // OOM or misconfiguration; true on success (and true if the cache is
+    // already enabled with a budget >= max_verify_tokens and the same dtype).
+    LLAMA_API bool llama_memory_enable_verify_cache(
+            llama_memory_t mem,
+                       int max_verify_tokens,
+             enum ggml_type persist_type);
+
+    LLAMA_API void llama_memory_disable_verify_cache(llama_memory_t mem);
+
+    // Roll the SSM recurrent state of seq_id back to the slot captured during
+    // the last verify forward. commit_n is 1-based: 1..max_verify_tokens.
+    // Updates conv_state and ssm_state in place. No-op if the verify cache is
+    // disabled or the sequence has no active cell.
+    LLAMA_API void llama_memory_rollback_to_verify_slot(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                       int commit_n);
+
     //
     // State / sessions
     //
