@@ -71,6 +71,15 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * parent_ids    = nullptr,
                 ggml_tensor * persist_inter = nullptr);
 
+    // If the hybrid verify cache is enabled, emit a ggml_cpy of the layer's
+    // conv_input into the persistent conv_input_cache so replay-free
+    // rollback can reconstruct the conv state for any accepted prefix. When
+    // the verify cache is off, this is a no-op. conv_input shape is
+    // [(d_conv - 1) + n_tokens, conv_channels, n_seqs]; the cache is 2D
+    // [(d_conv - 1) + max_verify_tokens, conv_channels] and assumes
+    // n_seqs == 1 during spec decoding.
+    void build_persist_conv_input(ggml_cgraph * gf, int il, ggml_tensor * conv_input);
+
     // choose one of two implementations above based on the number of tokens
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
                 ggml_tensor * q,

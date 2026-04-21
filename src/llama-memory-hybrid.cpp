@@ -518,6 +518,10 @@ ggml_tensor * llama_memory_hybrid_context::get_ssm_intermediate(int32_t il) cons
     return mem ? mem->get_ssm_intermediate(il) : nullptr;
 }
 
+ggml_tensor * llama_memory_hybrid_context::get_conv_input_cache(int32_t il) const {
+    return mem ? mem->get_conv_input_cache(il) : nullptr;
+}
+
 //
 // verify-cache (Phase 2) — persist buffers for speculative decoding rollback
 //
@@ -645,6 +649,16 @@ ggml_tensor * llama_memory_hybrid::get_ssm_intermediate(int32_t il) const {
         return nullptr;
     }
     return ssm_intermediate[il];
+}
+
+ggml_tensor * llama_memory_hybrid::get_conv_input_cache(int32_t il) const {
+    if (!m_verify_cache_enabled) {
+        return nullptr;
+    }
+    if (il < 0 || il >= (int32_t) conv_input_cache.size()) {
+        return nullptr;
+    }
+    return conv_input_cache[il];
 }
 
 void llama_memory_hybrid::rollback_to_verify_slot(llama_seq_id seq_id, int n_verify, int commit_n) {

@@ -391,6 +391,43 @@ ggml_tensor * llm_build_delta_net_base::build_gated_delta_net(
     return result;
 }
 
+void llm_build_delta_net_base::build_persist_conv_input(ggml_cgraph * gf, int il, ggml_tensor * conv_input) {
+    ggml_tensor * conv_cache = nullptr;
+    if (const auto * hctx = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+        conv_cache = hctx->get_conv_input_cache(il);
+    }
+    if (conv_cache == nullptr) {
+        return; // verify cache disabled — no-op
+    }
+
+    // conv_input shape:        [(d_conv-1) + n_tokens, conv_channels, n_seqs]
+    // conv_input_cache shape:  [(d_conv-1) + max_verify_tokens, conv_channels]  (n_seqs=1 assumed)
+    //
+    // We copy the live conv_input (which may be shorter along dim 0 than the
+    // cache if n_tokens < max_verify_tokens) into the leading rows of a
+    // matching 2D view of the cache. Columns along conv_channels are
+    // contiguous in both tensors; the cache's dim-0 stride is its full
+    // window including the headroom for max_verify_tokens.
+    const int64_t live_window   = conv_input->ne[0];
+    const int64_t conv_channels = conv_input->ne[1];
+    GGML_ASSERT(conv_input->ne[2] == 1 && "verify-cache conv persist assumes n_seqs == 1");
+    GGML_ASSERT(conv_cache->ne[1] == conv_channels);
+    GGML_ASSERT(conv_cache->ne[0] >= live_window);
+
+    // Slim view of the cache covering only the live window so the ggml_cpy
+    // destination shape matches the source.
+    ggml_tensor * cache_view = ggml_view_2d(ctx0, conv_cache,
+        live_window, conv_channels,
+        conv_cache->nb[1], 0);
+
+    // Drop the n_seqs=1 outer dim from conv_input to match cache_view's 2D shape.
+    ggml_tensor * src_view = ggml_view_2d(ctx0, conv_input,
+        live_window, conv_channels,
+        conv_input->nb[1], 0);
+
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_view, cache_view));
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_fused(
         ggml_tensor * q,
         ggml_tensor * k,

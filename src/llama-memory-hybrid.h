@@ -99,6 +99,12 @@ public:
     // attention-only or the verify cache is disabled.
     ggml_tensor * get_ssm_intermediate(int32_t il) const;
 
+    // conv_input_cache tensor for recurrent layer `il`, or nullptr if the
+    // layer is attention-only or the verify cache is disabled. Graph
+    // builders write the full conv_input into this tensor during verify so
+    // rollback can reconstruct the conv state for any accepted prefix.
+    ggml_tensor * get_conv_input_cache(int32_t il) const;
+
     // Roll the ssm recurrent state of `seq_id` back to the intermediate slot
     // captured at the `commit_n`-th accepted token of the last verify forward.
     // commit_n is 1-based (1..max_verify_tokens). No-op if verify cache is
@@ -209,6 +215,9 @@ public:
     // builders that already hold a hybrid context can reach the persist buffer
     // without needing a second pointer.
     ggml_tensor * get_ssm_intermediate(int32_t il) const;
+
+    // Pass-through to llama_memory_hybrid::get_conv_input_cache.
+    ggml_tensor * get_conv_input_cache(int32_t il) const;
 
 private:
     // the index of the next ubatch to process
