@@ -3554,6 +3554,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--spec-ngram-mod-preload"}, "PATH",
+        "preload the ngram-mod hash table from PATH at startup "
+        "(NGMD v2 K=4 format; use tools/ngram-mod-convert to migrate)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_mod_preload = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_NGRAM_MOD_PRELOAD"));
+    add_opt(common_arg(
         {"--spec-ddtree"},
         "enable DDTree-style tree-structured speculative verify (only effective "
         "with --spec-type ngram-mod targeting a hybrid delta-net model; see "

@@ -327,6 +327,11 @@ struct common_params_speculative {
 
     std::shared_ptr<common_ngram_mod> ngram_mod;
 
+    // Optional file path to preload the ngram-mod hash table at startup.
+    // Must be a NGMD v2 K=4 file (use tools/ngram-mod-convert to migrate
+    // from older K=2 user-side dumps). Empty = no preload.
+    std::string ngram_mod_preload;
+
     // DDTree (Phase 5/6) — tree-structured speculative verify over an
     // ngram-mod drafter. When ddtree_enable is true and the target is a
     // hybrid delta-net model, the server-side spec loop should build a

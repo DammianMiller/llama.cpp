@@ -939,6 +939,18 @@ common_speculative * common_speculative_init(
                 if (params.ngram_size_n < 16) {
                     LOG_WRN("%s: ngram_mod n=%d is too small - poor quality is possible, see: https://github.com/ggml-org/llama.cpp/pull/19164\n", __func__, params.ngram_size_n);
                 }
+
+                // Optional preload from a pre-trained NGMD v2 K=4 file.
+                if (!params.ngram_mod_preload.empty()) {
+                    if (params.ngram_mod->load(params.ngram_mod_preload)) {
+                        LOG_INF("%s: preloaded ngram_mod from '%s' (used=%zu/%zu)\n",
+                                __func__, params.ngram_mod_preload.c_str(),
+                                params.ngram_mod->get_used(), params.ngram_mod->size());
+                    } else {
+                        LOG_WRN("%s: preload of ngram_mod from '%s' failed (continuing with empty cache)\n",
+                                __func__, params.ngram_mod_preload.c_str());
+                    }
+                }
             }
 
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, params));
