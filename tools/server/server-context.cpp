@@ -58,6 +58,11 @@ struct server_slot {
 
     common_speculative * spec = nullptr;
 
+    // Set when llama_memory_enable_verify_cache succeeded during slot setup —
+    // signals that llama_memory_rollback_to_verify_slot is safe to use
+    // instead of seq_rm + activation replay at the spec-decode accept point.
+    bool verify_cache_enabled = false;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -792,6 +797,26 @@ private:
                         return false;
                     }
                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
+
+                    // For hybrid (delta-net) target models, enable the persist
+                    // verify cache so we can roll back after a verify forward
+                    // without replay. n_max is the largest verify length the
+                    // spec path will run — chain uses up to n_max drafts.
+                    if (llama_model_is_hybrid(model)) {
+                        const int max_verify = params_base.speculative.n_max;
+                        if (max_verify > 0) {
+                            const bool ok = llama_memory_enable_verify_cache(
+                                llama_get_memory(slot.ctx),
+                                max_verify,
+                                GGML_TYPE_F16);
+                            if (ok) {
+                                slot.verify_cache_enabled = true;
+                                SLT_INF(slot, "verify cache enabled (max_verify=%d, f16)\n", max_verify);
+                            } else {
+                                SLT_WRN(slot, "%s", "verify cache enable failed — falling back to seq_rm + activation replay\n");
+                            }
+                        }
+                    }
                 } else {
                     SLT_INF(slot, "%s", "speculative decoding context not initialized\n");
                 }
@@ -2937,7 +2962,26 @@ private:
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                // Replay-free rollback: when the verify persist cache is active,
+                // the gated_delta_net kernel already wrote per-token intermediate
+                // states during this verify step; jump straight to the committed
+                // slot without re-running anything. Falls back to seq_rm +
+                // activation replay when (a) the slot never enabled the cache,
+                // (b) zero drafts were accepted (commit_n=0 would need the
+                // pre-verify snapshot, which we don't hold), or (c) the target
+                // is not a hybrid model.
+                const int commit_n = (int)ids.size() - 1;
+                const bool used_verify_rollback =
+                    slot.verify_cache_enabled && commit_n > 0 && llama_model_is_hybrid(llama_get_model(ctx));
+
+                if (used_verify_rollback) {
+                    llama_memory_rollback_to_verify_slot(
+                        llama_get_memory(ctx), slot.id,
+                        /*n_verify=*/ (int)n_draft,
+                        /*commit_n=*/ commit_n);
+                } else {
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                }
 
                 // Activation replay for hybrid models: seq_rm may have restored the
                 // recurrent checkpoint to an earlier position than the target rollback,
@@ -2945,7 +2989,10 @@ private:
                 // from (cache_pos + 1) to target to bring both caches in sync.
                 // Uses slot.prompt.tokens as authoritative source to prevent underflow.
                 // Implements 'activation replay' from Snakes & Ladders (NeurIPS 2024).
-                {
+                //
+                // Skipped when the verify-cache rollback handled this step exactly —
+                // it already restored both cache halves to slot.prompt.n_tokens() - 1.
+                if (!used_verify_rollback) {
                     const llama_model * mdl = llama_get_model(ctx);
                     if (mdl && llama_model_is_hybrid(mdl)) {
                         const llama_pos cache_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id);
