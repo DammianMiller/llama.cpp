@@ -765,15 +765,21 @@ void llama_memory_hybrid::rollback_to_verify_slot(llama_seq_id seq_id, int n_ver
         scratch_src.resize(conv_slot_elems * sizeof(float));
         // conv_in strides: ne[0] = conv_window, ne[1] = conv_channels. We need
         // a rectangular block [slot+1 .. slot+1+d_conv_m1) x [0 .. conv_channels).
-        // ggml stores dim 0 contiguous, so columns are separated by ne[0] * sizeof(float).
-        const size_t row0_offset = (size_t) ((slot + 1)) * sizeof(float);
-        const size_t col_stride  = (size_t) conv_in->ne[0] * sizeof(float);
+        // Per-channel ggml_backend_tensor_get would issue conv_channels synchronous
+        // device->host memcpys per layer (~37k per rollback on 2B hybrid), costing
+        // ~600ms. Bulk-read the whole tensor once, then slice on CPU.
+        const int64_t conv_window = conv_in->ne[0];
+        std::vector<float> conv_full((size_t) conv_window * (size_t) d.conv_channels);
+        ggml_backend_tensor_get(conv_in, conv_full.data(), 0,
+                                conv_full.size() * sizeof(float));
+        float * scratch_f = (float *) scratch_src.data();
+        const int64_t row0 = (int64_t) (slot + 1);
         for (int64_t c = 0; c < d.conv_channels; ++c) {
-            ggml_backend_tensor_get(
-                conv_in,
-                scratch_src.data() + (size_t) c * d_conv_m1 * sizeof(float),
-                row0_offset + (size_t) c * col_stride,
-                (size_t) d_conv_m1 * sizeof(float));
+            const float * src = conv_full.data() + (size_t) c * conv_window + row0;
+            float       * dst = scratch_f + (size_t) c * d_conv_m1;
+            for (int64_t w = 0; w < d_conv_m1; ++w) {
+                dst[w] = src[w];
+            }
         }
 
         if (r_dst->type == GGML_TYPE_F32) {
