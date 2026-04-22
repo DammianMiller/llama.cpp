@@ -166,6 +166,11 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    cparams.verify_cache_max_tokens = params.verify_cache_max_tokens;
+    cparams.verify_cache_type       = params.verify_cache_type != GGML_TYPE_COUNT
+                                          ? params.verify_cache_type
+                                          : GGML_TYPE_F16;
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -2931,6 +2936,8 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
+        /*.verify_cache_max_tokens     =*/ 0,
+        /*.verify_cache_type           =*/ GGML_TYPE_F16,
     };
 
     return result;

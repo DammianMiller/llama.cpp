@@ -1480,6 +1480,21 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    // DDTree: when the user enabled --spec-ddtree, reserve persist verify
+    // cache at context init so the scheduler's allocation plan and CUDA-
+    // graph capture warmup aren't invalidated by a late-binding allocation.
+    // Budget = max(n_max, ddtree_budget) + 1 (the +1 covers the root slot).
+    if (params.speculative.ddtree_enable) {
+        const int n_max    = params.speculative.n_max;
+        const int ddbudget = params.speculative.ddtree_budget;
+        const int budget   = std::max(n_max, ddbudget) + 1;
+        cparams.verify_cache_max_tokens = budget > 1 ? budget : 0;
+        cparams.verify_cache_type       = GGML_TYPE_F16;
+    } else {
+        cparams.verify_cache_max_tokens = 0;
+        cparams.verify_cache_type       = GGML_TYPE_F16;
+    }
+
     return cparams;
 }
 

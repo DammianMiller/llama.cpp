@@ -44,4 +44,13 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    // DDTree persist-verify cache. 0 = disabled. When set, the hybrid memory
+    // allocates its ssm_intermediate + conv_input_cache at init time so the
+    // scheduler's allocation plan accounts for them up front. Without this
+    // path, allocating them post-init (via the late-binding
+    // llama_memory_enable_verify_cache API) triggers CUDA-graph capture
+    // warmup resets on subsequent decodes, costing ~10x decode tok/s.
+    int32_t   verify_cache_max_tokens = 0;
+    ggml_type verify_cache_type       = GGML_TYPE_F16;
 };

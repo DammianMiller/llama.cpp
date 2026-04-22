@@ -4085,6 +4085,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // Runtime kill switch: `GGML_CUDA_DISABLE_GRAPHS=1` forces every decode
+    // through per-kernel launches. Useful for diagnosing CUDA-graph-capture
+    // interactions with dynamically-allocated side buffers (e.g. DDFlash
+    // persist verify cache, which otherwise triggers warmup-reset on every
+    // decode and costs ~10x tok/s).
+    static bool disabled_by_env = [] {
+        const char * e = getenv("GGML_CUDA_DISABLE_GRAPHS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (disabled_by_env) {
+        return false;
+    }
+
     if (graph->graph == nullptr) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_AMPERE) {
             if (!graph->disable_due_to_gpu_arch) {

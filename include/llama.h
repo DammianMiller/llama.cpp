@@ -380,6 +380,17 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // DDTree persist verify cache. When > 0 AND the target is a hybrid
+        // delta-net model, the recurrent memory allocates ssm_intermediate +
+        // conv_input_cache buffers at init time (before the scheduler's
+        // graph_reserve runs) — this is required for the CUDA-graph capture
+        // to stay warm across decodes. Setting this is equivalent to calling
+        // llama_memory_enable_verify_cache() post-init, except that the
+        // buffers are part of the recurrent memory's own allocation plan.
+        // Leave 0 to disable. Typically set to max(n_max_spec, ddtree_budget) + 1.
+        int32_t        verify_cache_max_tokens;
+        enum ggml_type verify_cache_type; // GGML_TYPE_F32 or GGML_TYPE_F16 (default F16)
     };
 
     struct llama_model_tensor_override {

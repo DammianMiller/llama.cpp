@@ -8685,7 +8685,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else {
-                        res = new llama_memory_hybrid(
+                        auto * mh = new llama_memory_hybrid(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
@@ -8702,6 +8702,25 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
+
+                        // If the caller declared a verify-cache budget via
+                        // cparams, allocate the persist buffers now — before
+                        // the scheduler does its graph_reserve — so their
+                        // backend buffer is part of the cached allocation
+                        // plan. Allocating these post-init (via the late
+                        // llama_memory_enable_verify_cache path) shifts CUDA
+                        // tensor data pointers between decodes and causes
+                        // CUDA-graph capture warmup resets (~10x decode
+                        // regression).
+                        if (cparams.verify_cache_max_tokens > 0) {
+                            if (!mh->enable_verify_cache(cparams.verify_cache_max_tokens,
+                                                        cparams.verify_cache_type)) {
+                                LLAMA_LOG_WARN("%s: verify cache enable failed (max_verify=%d) — continuing without it\n",
+                                               __func__, cparams.verify_cache_max_tokens);
+                            }
+                        }
+
+                        res = mh;
                     }
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
