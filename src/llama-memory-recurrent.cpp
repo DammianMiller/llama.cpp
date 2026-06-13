@@ -1039,39 +1039,64 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
             return true;
         }
 
-        llama_batch_allocr balloc(hparams.n_pos_per_embd());
+        if (cell_count > size) {
+            LLAMA_LOG_ERROR("%s: not enough cells for seq restore (%u > %u)\n", __func__, cell_count, size);
+            return false;
+        }
 
-        llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
-
+        // Read positions from the saved state
+        std::vector<llama_pos> positions(cell_count);
         for (uint32_t i = 0; i < cell_count; ++i) {
-            llama_pos pos;
             uint32_t n_seq_id;
-
-            io.read_to(&pos,      sizeof(pos));
-            io.read_to(&n_seq_id, sizeof(n_seq_id));
+            io.read_to(&positions[i], sizeof(llama_pos));
+            io.read_to(&n_seq_id,     sizeof(n_seq_id));
 
             if (n_seq_id != 0) {
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
                 return false;
             }
-
-            ubatch.pos[i] = pos;
         }
-        ubatch.n_seq_id[0] = 1;
-        ubatch.seq_id[0] = &dest_seq_id;
 
-        if (!find_slot(ubatch)) {
-            LLAMA_LOG_ERROR("%s: failed to find available cells in kv cache\n", __func__);
+        // Find a contiguous block of cell_count empty cells.
+        // state_read_data writes tensor data as a contiguous block at head offset,
+        // so cells must be contiguous starting from head.
+        uint32_t block_start = size; // sentinel
+        for (uint32_t start = 0; start + cell_count <= size; ++start) {
+            bool all_empty = true;
+            for (uint32_t j = 0; j < cell_count; ++j) {
+                if (!cells[start + j].is_empty() || cells[start + j].pos >= 0) {
+                    all_empty = false;
+                    break;
+                }
+            }
+            if (all_empty) {
+                block_start = start;
+                break;
+            }
+        }
+
+        if (block_start == size) {
+            LLAMA_LOG_WARN("%s: no contiguous block of %u empty cells available, will re-process\n",
+                __func__, cell_count);
             return false;
         }
 
-        // DEBUG CHECK: kv.head should be our first cell, kv.head + cell_count - 1 should be our last cell (verify seq_id and pos values)
-        // Assume that this is one contiguous block of cells
-        GGML_ASSERT(head + cell_count <= size);
-        GGML_ASSERT(cells[head].pos == ubatch.pos[0]);
-        GGML_ASSERT(cells[head + cell_count - 1].pos == ubatch.pos[cell_count - 1]);
-        GGML_ASSERT(cells[head].has_seq_id(dest_seq_id));
-        GGML_ASSERT(cells[head + cell_count - 1].has_seq_id(dest_seq_id));
+        // Assign cells contiguously
+        llama_pos max_pos = -1;
+        int32_t tail_cell = -1;
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            auto & cell = cells[block_start + i];
+            cell.pos = positions[i];
+            cell.seq_id.insert(dest_seq_id);
+            cell.src = block_start + i;
+            used++;
+            if (cell.pos > max_pos) {
+                max_pos = cell.pos;
+                tail_cell = block_start + i;
+            }
+        }
+        cells[dest_seq_id].tail = tail_cell;
+        head = block_start;
     } else {
         // whole KV cache restore
 

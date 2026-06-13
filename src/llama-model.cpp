@@ -8041,7 +8041,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 // For recurrent/hybrid models, allocate enough cells for checkpointing
                 // during speculative decoding rollback. Each sequence needs at least
                 // 1 active cell + checkpoint cells for state restoration.
-                const uint32_t rs_cells = std::max((uint32_t) 4, cparams.n_seq_max * 4);
+                const char * rs_env = getenv("LLAMA_RS_CELLS");
+                const uint32_t rs_cells = rs_env
+                    ? std::max((uint32_t) 4, (uint32_t) std::atoi(rs_env))
+                    : std::max((uint32_t) 4, cparams.n_seq_max * 4);
 
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(

@@ -94,7 +94,7 @@ private:
     // before speculative batches, enabling rollback without extra GPU cells.
     // Ring buffer depth allows rollback to any of the last N positions,
     // which is critical when multiple draft tokens are generated and partially rejected.
-    static constexpr size_t CHECKPOINT_RING_DEPTH = 6;
+    static constexpr size_t CHECKPOINT_RING_DEPTH = 32;
 
     struct recurrent_checkpoint {
         llama_pos     pos = -1;
@@ -105,7 +105,7 @@ private:
     };
 
     struct checkpoint_ring {
-        recurrent_checkpoint slots[6]; // matches CHECKPOINT_RING_DEPTH
+        recurrent_checkpoint slots[32]; // matches CHECKPOINT_RING_DEPTH
         size_t write_idx = 0;          // next slot to write into
         size_t count     = 0;          // number of valid entries (up to CHECKPOINT_RING_DEPTH)
     };
