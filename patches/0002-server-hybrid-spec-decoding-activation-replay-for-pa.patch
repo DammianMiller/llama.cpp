@@ -1,0 +1,116 @@
+From 8ca696883c93885d5a12cf6632f7d583a16b6a49 Mon Sep 17 00:00:00 2001
+From: Dammian Miller <dammian.miller@gmail.com>
+Date: Fri, 10 Apr 2026 18:54:55 +1000
+Subject: [PATCH 2/2] server: hybrid spec decoding activation replay for
+ partial rollback
+
+Port from feature/turboquant-kv (commit 23fce085d) to fix SSM state
+corruption during partial speculative rollback in hybrid models.
+
+The prior fix only triggered when checkpoint was at EXACTLY p0-1. But
+during spec decoding, partial acceptance means checkpoint.pos = K while
+p0-1 = K+m (m = accepted drafts, >= 1), so exact match never fires.
+Fallback path only updated cell positions without restoring SSM state,
+causing recurrent state drift and degenerate output.
+
+Fix:
+1. src/llama-memory-hybrid.cpp: Accept any checkpoint at pos <= p0-1.
+   When checkpoint is further back, restore it and trim attention KV
+   to match checkpoint position.
+2. tools/server/server-context.cpp: After seq_rm, re-decode tokens
+   from (cache_pos+1) to target via llama_decode (activation replay).
+   Uses slot.prompt.tokens as authoritative source.
+
+Implements 'activation replay' from Snakes & Ladders (NeurIPS 2024).
+
+Verified on Qwen3.5-35B-A3B-IQ4_XS: replay fires correctly on
+speculative rollbacks, eliminating state corruption that caused
+looping behavior in tool-use workloads.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/llama-memory-hybrid.cpp     | 10 +++++++--
+ tools/server/server-context.cpp | 40 +++++++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 0b3b95587..2de3c5cde 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -314,14 +314,20 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
+             return false;
+         }
+ 
++        // Accept checkpoint at pos <= p0-1 (not just == p0-1). When checkpoint
++        // is further back than target, restore it and trim attention KV to match.
++        // Server's activation replay re-decodes tokens from (ckpt.pos + 1) to
++        // (p0 - 1) to bring both caches in sync.
+         auto it = cpu_checkpoints.find(seq_id);
+-        if (it != cpu_checkpoints.end() && it->second.valid && it->second.pos == p0 - 1) {
++        if (it != cpu_checkpoints.end() && it->second.valid && it->second.pos <= p0 - 1) {
+             if (!restore_recurrent_checkpoint(seq_id)) {
+                 return false;
+             }
++            const llama_pos attn_trim_from = it->second.pos + 1;
++            return mem_attn->seq_rm(seq_id, attn_trim_from, p1);
+         } else {
+             // Fallback: keep recurrent positions aligned with attention cache even if
+-            // we don't have an exact checkpoint for p0 - 1.
++            // we don't have a usable checkpoint.
+             bool aligned = false;
+             for (auto & cell : mem_recr->cells) {
+                 if (cell.has_seq_id(seq_id) && cell.pos >= p0) {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b31981c56..993b0436d 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2939,6 +2939,46 @@ private:
+ 
+                 llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+ 
++                // Activation replay for hybrid models: seq_rm may have restored the
++                // recurrent checkpoint to an earlier position than the target rollback,
++                // leaving the attention KV cache trimmed to match. Re-decode tokens
++                // from (cache_pos + 1) to target to bring both caches in sync.
++                // Uses slot.prompt.tokens as authoritative source to prevent underflow.
++                // Implements 'activation replay' from Snakes & Ladders (NeurIPS 2024).
++                {
++                    const llama_model * mdl = llama_get_model(ctx);
++                    if (mdl && llama_model_is_hybrid(mdl)) {
++                        const llama_pos cache_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id);
++                        const llama_pos expected_pos = (llama_pos)slot.prompt.n_tokens() - 1;
++
++                        if (cache_pos >= 0 && cache_pos < expected_pos) {
++                            const int n_replay = (int)(expected_pos - cache_pos);
++                            if (n_replay > 0 && (size_t)(cache_pos + n_replay) < slot.prompt.tokens.size()) {
++                                SLT_WRN(slot, "hybrid activation replay: %d tokens from prompt (cache=%d, target=%d)\n",
++                                    n_replay, (int)cache_pos, (int)expected_pos);
++
++                                llama_batch replay_batch = llama_batch_init(n_replay, 0, 1);
++                                replay_batch.n_tokens = n_replay;
++                                for (int ri = 0; ri < n_replay; ri++) {
++                                    const int prompt_idx = (int)(cache_pos + 1) + ri;
++                                    replay_batch.token[ri]     = slot.prompt.tokens[prompt_idx];
++                                    replay_batch.pos[ri]       = cache_pos + 1 + ri;
++                                    replay_batch.n_seq_id[ri]  = 1;
++                                    replay_batch.seq_id[ri][0] = slot.id;
++                                    replay_batch.logits[ri]    = (ri == n_replay - 1) ? 1 : 0;
++                                }
++
++                                const int ret = llama_decode(ctx, replay_batch);
++                                llama_batch_free(replay_batch);
++
++                                if (ret != 0) {
++                                    SLT_WRN(slot, "activation replay failed (ret=%d)\n", ret);
++                                }
++                            }
++                        }
++                    }
++                }
++
+                 for (size_t i = 0; i < ids.size(); ++i) {
+                     completion_token_output result;
+ 
+-- 
+2.51.0
+
