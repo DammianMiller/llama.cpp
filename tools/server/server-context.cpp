@@ -2921,7 +2921,7 @@ private:
                         if (cache_pos >= 0 && cache_pos < expected_pos) {
                             const int n_replay = (int)(expected_pos - cache_pos);
                             if (n_replay > 0 && (size_t)(cache_pos + n_replay) < slot.prompt.tokens.size()) {
-                                SLT_DBG(slot, "hybrid activation replay: %d tokens from prompt (cache=%d, target=%d)\n",
+                                SLT_INF(slot, "hybrid activation replay: %d tokens from prompt (cache=%d, target=%d)\n",
                                     n_replay, (int)cache_pos, (int)expected_pos);
 
                                 llama_batch replay_batch = llama_batch_init(n_replay, 0, 1);
