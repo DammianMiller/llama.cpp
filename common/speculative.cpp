@@ -543,12 +543,28 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
     // consecutive accept rounds with low acceptance fraction (< 0.5)
     int n_low = 0;
 
+    // configurable low-acceptance reset streak threshold (0 = disabled)
+    int reset_streak = 3;
+
+    // persistence path (empty = disabled); saved on destruction.
+    std::string persist_path;
+
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
 
     common_speculative_state_ngram_mod(enum common_speculative_type type, common_ngram_mod & mod)
         : common_speculative_state(type), mod(mod), verbose(std::getenv("LLAMA_TRACE") != nullptr) {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
+    }
+
+    ~common_speculative_state_ngram_mod() override {
+        if (!persist_path.empty()) {
+            if (mod.save(persist_path)) {
+                LOG_INF("ngram_mod: persisted state to %s (used=%zu/%zu)\n", persist_path.c_str(), mod.get_used(), mod.size());
+            } else {
+                LOG_WRN("ngram_mod: failed to persist state to %s\n", persist_path.c_str());
+            }
+        }
     }
 
     void begin(const llama_tokens & prompt) override {
@@ -644,7 +660,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
             const double f_acc = (double)n_accepted / (double)n_draft_last;
             if (f_acc < 0.5) {
                 n_low++;
-                if (n_low >= 3) {
+                if (reset_streak > 0 && n_low >= reset_streak) {
                     LOG_WRN("%s: low acceptance streak (%d) – resetting ngram_mod\n", __func__, n_low);
 
                     mod.reset();
@@ -939,6 +955,19 @@ common_speculative * common_speculative_init(
                 if (params.ngram_size_n < 16) {
                     LOG_WRN("%s: ngram_mod n=%d is too small - poor quality is possible, see: https://github.com/ggml-org/llama.cpp/pull/19164\n", __func__, params.ngram_size_n);
                 }
+
+                // attempt to load persisted state
+                if (!params.ngram_mod_persist_path.empty()) {
+                    if (params.ngram_mod->load(params.ngram_mod_persist_path)) {
+                        LOG_INF("%s: loaded ngram_mod state from %s (used=%zu/%zu)\n", __func__,
+                                params.ngram_mod_persist_path.c_str(),
+                                params.ngram_mod->get_used(),
+                                params.ngram_mod->size());
+                    } else {
+                        LOG_INF("%s: no persisted ngram_mod state at %s (starting fresh)\n", __func__,
+                                params.ngram_mod_persist_path.c_str());
+                    }
+                }
             }
 
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, params));
@@ -1000,7 +1029,10 @@ common_speculative * common_speculative_init(
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_MOD: {
                 GGML_ASSERT(config.params.ngram_mod);
-                impls.push_back(std::make_unique<common_speculative_state_ngram_mod>(config.type, *config.params.ngram_mod));
+                auto st = std::make_unique<common_speculative_state_ngram_mod>(config.type, *config.params.ngram_mod);
+                st->reset_streak = config.params.ngram_mod_reset_streak;
+                st->persist_path = config.params.ngram_mod_persist_path;
+                impls.push_back(std::move(st));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {

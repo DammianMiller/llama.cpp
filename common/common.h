@@ -327,6 +327,13 @@ struct common_params_speculative {
 
     std::shared_ptr<common_ngram_mod> ngram_mod;
 
+    // persist ngram_mod state across restarts. Empty = disabled.
+    std::string ngram_mod_persist_path;
+
+    // reset ngram_mod cache after N consecutive low-acceptance (<0.5) requests.
+    // 0 = disable auto-reset; default 3 (original hardcoded behaviour).
+    int ngram_mod_reset_streak = 3;
+
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding           // NOLINT
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding          // NOLINT
 

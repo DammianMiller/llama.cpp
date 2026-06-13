@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <string>
 #include <cstddef>
 
 //
@@ -28,6 +29,11 @@ struct common_ngram_mod {
 
     size_t size()       const;
     size_t size_bytes() const;
+
+    // persistence: save/load raw entries + metadata to disk
+    // returns true on success. File format: magic "NGMD" + u32 n + u64 size + raw entries.
+    bool save(const std::string & path) const;
+    bool load(const std::string & path);
 
 private:
     size_t n; // ngram size to hash

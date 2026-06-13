@@ -3544,6 +3544,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--spec-ngram-persist"}, "PATH",
+        "persist ngram-mod state to disk (loaded on start, saved on shutdown)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_mod_persist_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_PERSIST"));
+    add_opt(common_arg(
+        {"--spec-ngram-reset-streak"}, "N",
+        string_format("reset ngram-mod cache after N consecutive low-acceptance requests (0 = disable; default: %d)", params.speculative.ngram_mod_reset_streak),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("reset streak must be >= 0");
+            }
+            params.speculative.ngram_mod_reset_streak = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_RESET_STREAK"));
+    add_opt(common_arg(
         {"--spec-ngram-min-hits"}, "N",
         string_format("minimum hits for ngram-map speculative decoding (default: %d)", params.speculative.ngram_min_hits),
         [](common_params & params, int value) {
