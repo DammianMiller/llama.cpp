@@ -1,0 +1,11 @@
+{"label":"A1-same","n_pred":256,"predicted_ms":9618.563,"prompt_n":46,"prompt_ms":150.149,"draft_n":1,"draft_accepted":0,"tokens_cached":301,"tps":26.62,"prompt_tps":306,"accept_pct":"0.0"}
+{"label":"A2-same","n_pred":256,"predicted_ms":4082.021,"prompt_n":46,"prompt_ms":128.713,"draft_n":167,"draft_accepted":166,"tokens_cached":301,"tps":62.71,"prompt_tps":357,"accept_pct":"99.4"}
+{"label":"A3-same","n_pred":256,"predicted_ms":4111.972,"prompt_n":46,"prompt_ms":123.761,"draft_n":167,"draft_accepted":165,"tokens_cached":301,"tps":62.26,"prompt_tps":372,"accept_pct":"98.8"}
+{"label":"B1-varied","n_pred":256,"predicted_ms":4276.598,"prompt_n":46,"prompt_ms":127.768,"draft_n":164,"draft_accepted":162,"tokens_cached":301,"tps":59.86,"prompt_tps":360,"accept_pct":"98.8"}
+{"label":"B2-varied","n_pred":256,"predicted_ms":4973.081,"prompt_n":30,"prompt_ms":116.722,"draft_n":140,"draft_accepted":140,"tokens_cached":285,"tps":51.48,"prompt_tps":257,"accept_pct":"100.0"}
+{"label":"B3-varied","n_pred":256,"predicted_ms":9823.173,"prompt_n":36,"prompt_ms":125.721,"draft_n":0,"draft_accepted":0,"tokens_cached":291,"tps":26.06,"prompt_tps":286,"accept_pct":"N/A"}
+{"label":"B4-varied","n_pred":256,"predicted_ms":4142.414,"prompt_n":66,"prompt_ms":147.016,"draft_n":165,"draft_accepted":165,"tokens_cached":321,"tps":61.80,"prompt_tps":449,"accept_pct":"100.0"}
+{"label":"B5-varied","n_pred":256,"predicted_ms":9213.949,"prompt_n":29,"prompt_ms":124.473,"draft_n":28,"draft_accepted":19,"tokens_cached":285,"tps":27.78,"prompt_tps":233,"accept_pct":"67.9"}
+{"label":"B6-varied","n_pred":256,"predicted_ms":9786.952,"prompt_n":27,"prompt_ms":120.011,"draft_n":0,"draft_accepted":0,"tokens_cached":282,"tps":26.16,"prompt_tps":225,"accept_pct":"N/A"}
+{"label":"C-recall0","n_pred":256,"predicted_ms":4384.993,"prompt_n":46,"prompt_ms":129.845,"draft_n":167,"draft_accepted":159,"tokens_cached":301,"tps":58.38,"prompt_tps":354,"accept_pct":"95.2"}
+{"label":"D-no-cache","n_pred":256,"predicted_ms":7600.077,"prompt_n":46,"prompt_ms":131.448,"draft_n":69,"draft_accepted":66,"tokens_cached":301,"tps":33.68,"prompt_tps":350,"accept_pct":"95.7"}

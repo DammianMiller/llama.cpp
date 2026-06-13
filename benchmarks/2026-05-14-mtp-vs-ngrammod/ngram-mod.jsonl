@@ -1,0 +1,11 @@
+{"label":"A1-same","n_pred":256,"predicted_ms":1941.303,"prompt_n":43,"prompt_ms":52.285,"draft_n":0,"draft_accepted":0,"tokens_cached":298,"tps":131.87,"prompt_tps":822,"accept_pct":"N/A"}
+{"label":"A2-same","n_pred":256,"predicted_ms":1558.512,"prompt_n":43,"prompt_ms":59.732,"draft_n":128,"draft_accepted":71,"tokens_cached":298,"tps":164.26,"prompt_tps":720,"accept_pct":"55.5"}
+{"label":"A3-same","n_pred":256,"predicted_ms":1289.42,"prompt_n":43,"prompt_ms":57.072,"draft_n":192,"draft_accepted":130,"tokens_cached":298,"tps":198.54,"prompt_tps":753,"accept_pct":"67.7"}
+{"label":"B1-varied","n_pred":256,"predicted_ms":1360.502,"prompt_n":43,"prompt_ms":56.581,"draft_n":251,"draft_accepted":134,"tokens_cached":298,"tps":188.17,"prompt_tps":760,"accept_pct":"53.4"}
+{"label":"B2-varied","n_pred":256,"predicted_ms":1942.023,"prompt_n":29,"prompt_ms":61.463,"draft_n":0,"draft_accepted":0,"tokens_cached":284,"tps":131.82,"prompt_tps":472,"accept_pct":"N/A"}
+{"label":"B3-varied","n_pred":256,"predicted_ms":1965.61,"prompt_n":34,"prompt_ms":59.272,"draft_n":0,"draft_accepted":0,"tokens_cached":289,"tps":130.24,"prompt_tps":574,"accept_pct":"N/A"}
+{"label":"B4-varied","n_pred":256,"predicted_ms":1913.057,"prompt_n":61,"prompt_ms":71.025,"draft_n":0,"draft_accepted":0,"tokens_cached":316,"tps":133.82,"prompt_tps":859,"accept_pct":"N/A"}
+{"label":"B5-varied","n_pred":182,"predicted_ms":1357.165,"prompt_n":29,"prompt_ms":44.892,"draft_n":0,"draft_accepted":0,"tokens_cached":210,"tps":134.10,"prompt_tps":646,"accept_pct":"N/A"}
+{"label":"B6-varied","n_pred":256,"predicted_ms":1921.866,"prompt_n":24,"prompt_ms":50.623,"draft_n":0,"draft_accepted":0,"tokens_cached":279,"tps":133.20,"prompt_tps":474,"accept_pct":"N/A"}
+{"label":"C-recall0","n_pred":256,"predicted_ms":1919.218,"prompt_n":43,"prompt_ms":55.116,"draft_n":0,"draft_accepted":0,"tokens_cached":298,"tps":133.39,"prompt_tps":780,"accept_pct":"N/A"}
+{"label":"D-no-cache","n_pred":256,"predicted_ms":1911.394,"prompt_n":43,"prompt_ms":56.838,"draft_n":0,"draft_accepted":0,"tokens_cached":298,"tps":133.93,"prompt_tps":757,"accept_pct":"N/A"}

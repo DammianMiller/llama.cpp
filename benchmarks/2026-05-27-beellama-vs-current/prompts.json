@@ -1,0 +1,23 @@
+[
+  {
+    "id": "codegen-repetitive",
+    "label": "Code-gen / repetitive (ngram-friendly)",
+    "messages": [
+      {"role": "user", "content": "Write a Python function `fibonacci(n)` that returns the nth Fibonacci number using memoization. Then write `factorial(n)` using memoization. Then write `prime_sieve(n)` using the Sieve of Eratosthenes. Use type hints. Return the three functions as a single code block."}
+    ]
+  },
+  {
+    "id": "codereview-medium",
+    "label": "Code review / medium novelty",
+    "messages": [
+      {"role": "user", "content": "Review this Python function for bugs and style issues:\n\n```python\ndef process_batch(items, factor=1):\n    results = []\n    for i in range(len(items)):\n        if items[i] != None and items[i] > 0:\n            x = items[i] * factor\n            results.append(x)\n    return results\n```\n\nList specific issues with line references, then provide a refactored version."}
+    ]
+  },
+  {
+    "id": "explain-novel",
+    "label": "Explanation / novel content (hardest for ngram)",
+    "messages": [
+      {"role": "user", "content": "Explain the difference between weak references and strong references in Python's garbage collector, using a concrete example involving the `weakref` module. Then explain how this relates to reference cycles and the cyclic garbage collector."}
+    ]
+  }
+]

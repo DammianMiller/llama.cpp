@@ -1,0 +1,5 @@
+{"run":1,"n_pred":256,"predicted_ms":736.376,"draft_n":256,"draft_accepted":201,"tps":347.65,"accept_pct":"78.5"}
+{"run":2,"n_pred":256,"predicted_ms":735.635,"draft_n":256,"draft_accepted":201,"tps":348.00,"accept_pct":"78.5"}
+{"run":3,"n_pred":256,"predicted_ms":739.426,"draft_n":256,"draft_accepted":201,"tps":346.21,"accept_pct":"78.5"}
+{"run":4,"n_pred":256,"predicted_ms":740.468,"draft_n":256,"draft_accepted":201,"tps":345.73,"accept_pct":"78.5"}
+{"run":5,"n_pred":256,"predicted_ms":733.094,"draft_n":256,"draft_accepted":201,"tps":349.20,"accept_pct":"78.5"}

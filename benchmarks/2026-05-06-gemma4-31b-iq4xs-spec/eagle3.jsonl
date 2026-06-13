@@ -1,0 +1,5 @@
+{"run":1,"n_pred":256,"predicted_ms":11342.914,"prompt_n":102,"prompt_ms":198.754,"draft_n":392,"draft_accepted":28,"tps":22.57,"accept_pct":"7.1"}
+{"run":2,"n_pred":256,"predicted_ms":9738.744,"prompt_n":102,"prompt_ms":187.656,"draft_n":0,"draft_accepted":0,"tps":26.29,"accept_pct":"N/A"}
+{"run":3,"n_pred":256,"predicted_ms":9978.737,"prompt_n":102,"prompt_ms":188.746,"draft_n":0,"draft_accepted":0,"tps":25.65,"accept_pct":"N/A"}
+{"run":4,"n_pred":256,"predicted_ms":9901.885,"prompt_n":102,"prompt_ms":189.53,"draft_n":0,"draft_accepted":0,"tps":25.85,"accept_pct":"N/A"}
+{"run":5,"n_pred":256,"predicted_ms":9862.009,"prompt_n":102,"prompt_ms":188.741,"draft_n":0,"draft_accepted":0,"tps":25.96,"accept_pct":"N/A"}
